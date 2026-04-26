@@ -39,6 +39,12 @@ class Employee extends Model
         return $this->hasMany(EmployeeCourse::class);
     }
 
+    public function mobilizationEmployees(): HasMany
+    {
+        return $this->hasMany(MobilizationEmployee::class);
+    }
+    
+    // Алиас для совместимости
     public function mobilizations(): HasMany
     {
         return $this->hasMany(MobilizationEmployee::class);

@@ -29,17 +29,11 @@ class EmployeeCourse extends Model
         'updated_at' => 'datetime',
     ];
 
-    /**
-     * Get the employee that owns the course record.
-     */
     public function employee(): BelongsTo
     {
         return $this->belongsTo(Employee::class);
     }
 
-    /**
-     * Get the course that owns the record.
-     */
     public function course(): BelongsTo
     {
         return $this->belongsTo(Course::class);
