@@ -18,8 +18,7 @@ class EmployeeController extends Controller
     /**
      * 4.1 GET /employees - Список сотрудников
      */
-    public function index(Request $request)
-    {
+    public function index(Request $request)    {
         try {
             $page = $request->get('page', 1);
             $limit = $request->get('limit', 50);
@@ -59,11 +58,28 @@ class EmployeeController extends Controller
                               ->get();
             
             $formattedEmployees = $employees->map(function($employee) {
+                // Формируем ФИО из трех полей
+                $fullName = trim(implode(' ', array_filter([
+                    $employee->last_name,
+                    $employee->first_name,
+                    $employee->middle_name
+                ])));
+                
+                // Если ФИО пустое, используем full_name из БД как запасной вариант
+                if (empty($fullName)) {
+                    $fullName = $employee->full_name;
+                }
+                
                 return [
                     'id' => $employee->id,
-                    'name' => $employee->full_name,
+                    'full_name' => $fullName,
+                    'last_name' => $employee->last_name,
+                    'first_name' => $employee->first_name,
+                    'middle_name' => $employee->middle_name,
                     'position' => $employee->position?->name ?? 'Не указана',
+                    'position_id' => $employee->position_id,
                     'brigade' => $employee->brigade?->name ?? 'Не указана',
+                    'brigade_id' => $employee->brigade_id,
                     'status' => $employee->status,
                     'email' => $employee->email,
                     'phone' => $employee->phone
@@ -359,9 +375,8 @@ class EmployeeController extends Controller
     {
         try {
             $validator = Validator::make($request->all(), [
-                'full_name' => 'required|string|max:100',
-                'last_name' => 'nullable|string|max:50',
-                'first_name' => 'nullable|string|max:50',
+                'last_name' => 'required|string|max:50',
+                'first_name' => 'required|string|max:50',
                 'middle_name' => 'nullable|string|max:50',
                 'position_id' => 'nullable|exists:positions,id',
                 'brigade_id' => 'nullable|exists:brigades,id',
@@ -377,15 +392,47 @@ class EmployeeController extends Controller
                 ], 422);
             }
             
-            $employee = Employee::create($request->all());
+            // Собираем full_name из трех полей
+            $fullName = trim(implode(' ', array_filter([
+                $request->last_name,
+                $request->first_name,
+                $request->middle_name
+            ])));
+            
+            $employee = Employee::create([
+                'full_name' => $fullName,
+                'last_name' => $request->last_name,
+                'first_name' => $request->first_name,
+                'middle_name' => $request->middle_name,
+                'position_id' => $request->position_id,
+                'brigade_id' => $request->brigade_id,
+                'email' => $request->email,
+                'phone' => $request->phone,
+                'status' => $request->get('status', 'active')
+            ]);
+            
             $employee->load(['position', 'brigade']);
+            
+            // Формируем ответ с полным ФИО
+            $responseFullName = trim(implode(' ', array_filter([
+                $employee->last_name,
+                $employee->first_name,
+                $employee->middle_name
+            ])));
             
             return response()->json([
                 'id' => $employee->id,
-                'name' => $employee->full_name,
+                'full_name' => $responseFullName,
+                'last_name' => $employee->last_name,
+                'first_name' => $employee->first_name,
+                'middle_name' => $employee->middle_name,
                 'position' => $employee->position?->name ?? 'Не указана',
+                'position_id' => $employee->position_id,
                 'brigade' => $employee->brigade?->name ?? 'Не указана',
+                'brigade_id' => $employee->brigade_id,
                 'status' => $employee->status,
+                'email' => $employee->email,
+                'phone' => $employee->phone,
                 'createdAt' => $employee->created_at->toISOString()
             ], 201);
             

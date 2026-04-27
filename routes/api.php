@@ -8,6 +8,8 @@ use App\Http\Controllers\Api\DashboardController;
 use App\Http\Controllers\Api\BrigadeController;
 use App\Http\Controllers\Api\NotificationController;
 use App\Http\Controllers\Api\TrainingController;
+use App\Http\Controllers\Api\HeatMapController;
+use App\Http\Controllers\Api\CourseController;
 
 
 // Маршруты для сотрудников
@@ -94,6 +96,34 @@ Route::prefix('trainings')->group(function () {
     Route::get('/{id}', [TrainingController::class, 'show']);                            // 2.3
     Route::put('/{id}/complete', [TrainingController::class, 'completeTraining']);       // 2.6
     Route::put('/{id}/extend', [TrainingController::class, 'extendTraining']);           // 2.7
+});
+
+// Маршруты для тепловой карты
+Route::prefix('heatmap')->group(function () {
+    Route::get('/', [HeatMapController::class, 'getHeatmapData']);              // 3.1 GET /heatmap
+    Route::get('/summary', [HeatMapController::class, 'getSummary']);          // 3.3 GET /heatmap/summary
+    Route::get('/export', [HeatMapController::class, 'export']);               // 3.4 GET /heatmap/export
+    Route::get('/filters', [HeatMapController::class, 'getFilters']);          // 3.5 GET /heatmap/filters
+    Route::get('/matrix', [HeatMapController::class, 'getCompetenceMatrix']);  // Доп. матрица компетенций
+    Route::get('/employee/{employeeId}', [HeatMapController::class, 'getEmployeeData']); // 3.2 GET /heatmap/employee/{id}
+});
+
+// Маршруты для курсов и матрицы компетенций
+Route::prefix('courses')->group(function () {
+    Route::get('/', [CourseController::class, 'index']);                           // 6.1 GET /courses
+    Route::get('/categories', [CourseController::class, 'getCategories']);        // 6.2 GET /courses/categories
+    Route::post('/', [CourseController::class, 'store']);                         // 6.4 POST /courses
+    Route::get('/{id}', [CourseController::class, 'show']);                       // Детали курса
+    Route::get('/required/{positionId}', [CourseController::class, 'getRequiredCoursesForPosition']); // 6.3 GET /courses/required/{positionId}
+    Route::put('/{id}', [CourseController::class, 'update']);                     // 6.5 PUT /courses/{id}
+    Route::delete('/{id}', [CourseController::class, 'destroy']);                 // 6.6 DELETE /courses/{id}
+});
+
+// Маршруты для матрицы компетенций
+Route::prefix('matrix')->group(function () {
+    Route::get('/positions', [CourseController::class, 'getCompetenceMatrix']);   // 6.7 GET /matrix/positions
+    Route::put('/positions/{positionId}/courses/{courseId}', [CourseController::class, 'assignCourseToPosition']); // 6.8 PUT /matrix/positions/{positionId}/courses/{courseId}
+    Route::put('/brigades/{brigadeId}/courses/{courseId}', [CourseController::class, 'assignCourseToBrigade']);   // 6.9 PUT /matrix/brigades/{brigadeId}/courses/{courseId}
 });
 
 Route::get('/user', function (Request $request) {
