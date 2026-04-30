@@ -10,14 +10,24 @@ use Illuminate\Database\Eloquent\Relations\HasOne;
 class Employee extends Model
 {
     protected $fillable = [
-        'full_name', 'last_name', 'first_name', 'middle_name',
-        'position_id', 'brigade_id', 'email', 'phone', 'status'
+        'personnel_number',  // Добавлено
+        'full_name', 
+        'last_name', 
+        'first_name', 
+        'middle_name',
+        'position_id', 
+        'brigade_id', 
+        'department_id', 
+        'email', 
+        'phone', 
+        'status'
     ];
 
     protected $casts = [
         'created_at' => 'datetime',
         'updated_at' => 'datetime',
     ];
+
 
     public function position(): BelongsTo
     {
@@ -27,6 +37,12 @@ class Employee extends Model
     public function brigade(): BelongsTo
     {
         return $this->belongsTo(Brigade::class);
+    }
+
+    // Добавляем отношение к подразделению
+    public function department(): BelongsTo
+    {
+        return $this->belongsTo(Department::class);
     }
 
     public function userAccount(): HasOne
@@ -39,14 +55,14 @@ class Employee extends Model
         return $this->hasMany(EmployeeCourse::class);
     }
 
-    public function mobilizationEmployees(): HasMany
-    {
-        return $this->hasMany(MobilizationEmployee::class);
-    }
-    
-    // Алиас для совместимости
     public function mobilizations(): HasMany
     {
         return $this->hasMany(MobilizationEmployee::class);
+    }
+
+    // Подразделения, где сотрудник является руководителем
+    public function headedDepartments(): HasMany
+    {
+        return $this->hasMany(Department::class, 'head_employee_id');
     }
 }

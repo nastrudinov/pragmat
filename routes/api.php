@@ -10,6 +10,20 @@ use App\Http\Controllers\Api\NotificationController;
 use App\Http\Controllers\Api\TrainingController;
 use App\Http\Controllers\Api\HeatMapController;
 use App\Http\Controllers\Api\CourseController;
+use App\Http\Controllers\Api\DepartmentController;
+
+// Маршруты для подразделений (требуют аутентификации)
+
+    Route::prefix('departments')->group(function () {
+        Route::get('/', [DepartmentController::class, 'index']);                    // GET /departments
+        Route::get('/tree', [DepartmentController::class, 'index'])->defaults('tree', true); // GET /departments/tree
+        Route::post('/', [DepartmentController::class, 'store']);                  // POST /departments
+        Route::get('/{id}', [DepartmentController::class, 'show']);                // GET /departments/{id}
+        Route::get('/{id}/employees', [DepartmentController::class, 'getEmployees']); // GET /departments/{id}/employees
+        Route::put('/{id}', [DepartmentController::class, 'update']);              // PUT /departments/{id}
+        Route::delete('/{id}', [DepartmentController::class, 'destroy']);          // DELETE /departments/{id}
+    });
+
 
 
 // Маршруты для сотрудников
@@ -113,7 +127,8 @@ Route::prefix('courses')->group(function () {
     Route::get('/', [CourseController::class, 'index']);                           // 6.1 GET /courses
     Route::get('/categories', [CourseController::class, 'getCategories']);        // 6.2 GET /courses/categories
     Route::post('/', [CourseController::class, 'store']);                         // 6.4 POST /courses
-    Route::get('/{id}', [CourseController::class, 'show']);                       // Детали курса
+    Route::get('/{id}', [CourseController::class, 'show']);   
+    Route::get('/required/brigade/{brigadeId}', [CourseController::class, 'getRequiredCoursesForBrigade']);                    
     Route::get('/required/{positionId}', [CourseController::class, 'getRequiredCoursesForPosition']); // 6.3 GET /courses/required/{positionId}
     Route::put('/{id}', [CourseController::class, 'update']);                     // 6.5 PUT /courses/{id}
     Route::delete('/{id}', [CourseController::class, 'destroy']);                 // 6.6 DELETE /courses/{id}

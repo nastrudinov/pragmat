@@ -15,6 +15,8 @@ class DatabaseSeeder extends Seeder
         $this->call(EmployeeSeeder::class);
         $this->call(CourseCategorySeeder::class);
         $this->call(CourseSeeder::class);
+        // Создаем подразделения
+        $this->call(DepartmentSeeder::class);
         
         // Связи компетенций
         $this->call(PositionCourseRequirementSeeder::class);

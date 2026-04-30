@@ -18,13 +18,19 @@ class EmployeeController extends Controller
     /**
      * 4.1 GET /employees - Список сотрудников
      */
-    public function index(Request $request)    {
+   public function index(Request $request)
+    {
         try {
             $page = $request->get('page', 1);
             $limit = $request->get('limit', 50);
             
-            $query = Employee::with(['position', 'brigade'])
+            $query = Employee::with(['position', 'brigade', 'department'])
                 ->select('employees.*');
+            
+            // Фильтр по табельному номеру
+            if ($request->has('personnel_number')) {
+                $query->where('personnel_number', 'LIKE', "%{$request->personnel_number}%");
+            }
             
             // Фильтр по статусу
             if ($request->has('status')) {
@@ -41,21 +47,27 @@ class EmployeeController extends Controller
                 $query->where('position_id', $request->position_id);
             }
             
+            // Фильтр по подразделению
+            if ($request->has('department_id')) {
+                $query->where('department_id', $request->department_id);
+            }
+            
             // Поиск
             if ($request->has('search')) {
                 $search = $request->search;
                 $query->where(function($q) use ($search) {
-                    $q->where('full_name', 'LIKE', "%{$search}%")
-                      ->orWhere('last_name', 'LIKE', "%{$search}%")
-                      ->orWhere('first_name', 'LIKE', "%{$search}%")
-                      ->orWhere('email', 'LIKE', "%{$search}%");
+                    $q->where('personnel_number', 'LIKE', "%{$search}%")  // Добавлено
+                    ->orWhere('full_name', 'LIKE', "%{$search}%")
+                    ->orWhere('last_name', 'LIKE', "%{$search}%")
+                    ->orWhere('first_name', 'LIKE', "%{$search}%")
+                    ->orWhere('email', 'LIKE', "%{$search}%");
                 });
             }
             
             $total = $query->count();
             $employees = $query->skip(($page - 1) * $limit)
-                              ->take($limit)
-                              ->get();
+                            ->take($limit)
+                            ->get();
             
             $formattedEmployees = $employees->map(function($employee) {
                 // Формируем ФИО из трех полей
@@ -72,12 +84,15 @@ class EmployeeController extends Controller
                 
                 return [
                     'id' => $employee->id,
+                    'personnel_number' => $employee->personnel_number,  // Добавлено
                     'full_name' => $fullName,
                     'last_name' => $employee->last_name,
                     'first_name' => $employee->first_name,
                     'middle_name' => $employee->middle_name,
                     'position' => $employee->position?->name ?? 'Не указана',
                     'position_id' => $employee->position_id,
+                    'department' => $employee->department?->name ?? 'Не указано',
+                    'department_id' => $employee->department_id,
                     'brigade' => $employee->brigade?->name ?? 'Не указана',
                     'brigade_id' => $employee->brigade_id,
                     'status' => $employee->status,
@@ -107,8 +122,19 @@ class EmployeeController extends Controller
     public function show($id)
     {
         try {
-            $employee = Employee::with(['position', 'brigade', 'userAccount'])
+            $employee = Employee::with(['position', 'brigade', 'department', 'userAccount'])
                 ->findOrFail($id);
+            
+            // Формируем ФИО из трех полей
+            $fullName = trim(implode(' ', array_filter([
+                $employee->last_name,
+                $employee->first_name,
+                $employee->middle_name
+            ])));
+            
+            if (empty($fullName)) {
+                $fullName = $employee->full_name;
+            }
             
             // Получаем обучения сотрудника
             $trainings = EmployeeCourse::with('course')
@@ -128,12 +154,15 @@ class EmployeeController extends Controller
             
             return response()->json([
                 'id' => $employee->id,
-                'name' => $employee->full_name,
+                'personnel_number' => $employee->personnel_number,  // Добавлено
+                'full_name' => $fullName,
                 'last_name' => $employee->last_name,
                 'first_name' => $employee->first_name,
                 'middle_name' => $employee->middle_name,
                 'position' => $employee->position?->name ?? 'Не указана',
                 'position_id' => $employee->position_id,
+                'department' => $employee->department?->name ?? 'Не указано',
+                'department_id' => $employee->department_id,
                 'brigade' => $employee->brigade?->name ?? 'Не указана',
                 'brigade_id' => $employee->brigade_id,
                 'status' => $employee->status,
@@ -170,9 +199,19 @@ class EmployeeController extends Controller
                 ->where('status', 'active')
                 ->get()
                 ->map(function($employee) {
+                    $fullName = trim(implode(' ', array_filter([
+                        $employee->last_name,
+                        $employee->first_name,
+                        $employee->middle_name
+                    ])));
+                    
+                    if (empty($fullName)) {
+                        $fullName = $employee->full_name;
+                    }
+                    
                     return [
                         'id' => $employee->id,
-                        'name' => $employee->full_name,
+                        'name' => $fullName,
                         'position' => $employee->position?->name ?? 'Не указана',
                         'status' => $employee->status
                     ];
@@ -195,7 +234,7 @@ class EmployeeController extends Controller
             ], 500);
         }
     }
-    
+        
     /**
      * 4.4 GET /employees/search - Поиск сотрудников
      */
@@ -212,18 +251,31 @@ class EmployeeController extends Controller
                 ], 200);
             }
             
-            $employees = Employee::with(['position', 'brigade'])
-                ->where('full_name', 'LIKE', "%{$query}%")
-                ->orWhere('last_name', 'LIKE', "%{$query}%")
-                ->orWhere('first_name', 'LIKE', "%{$query}%")
-                ->orWhere('email', 'LIKE', "%{$query}%")
+            $employees = Employee::with(['position', 'brigade', 'department'])
+                ->where(function($q) use ($query) {
+                    $q->where('full_name', 'LIKE', "%{$query}%")
+                    ->orWhere('last_name', 'LIKE', "%{$query}%")
+                    ->orWhere('first_name', 'LIKE', "%{$query}%")
+                    ->orWhere('email', 'LIKE', "%{$query}%");
+                })
                 ->limit($limit)
                 ->get()
                 ->map(function($employee) {
+                    $fullName = trim(implode(' ', array_filter([
+                        $employee->last_name,
+                        $employee->first_name,
+                        $employee->middle_name
+                    ])));
+                    
+                    if (empty($fullName)) {
+                        $fullName = $employee->full_name;
+                    }
+                    
                     return [
                         'id' => $employee->id,
-                        'name' => $employee->full_name,
+                        'name' => $fullName,
                         'position' => $employee->position?->name ?? 'Не указана',
+                        'department' => $employee->department?->name ?? 'Не указано',
                         'brigade' => $employee->brigade?->name ?? 'Не указана'
                     ];
                 });
@@ -375,11 +427,13 @@ class EmployeeController extends Controller
     {
         try {
             $validator = Validator::make($request->all(), [
+                'personnel_number' => 'nullable|string|max:20|unique:employees,personnel_number',  // Добавлено
                 'last_name' => 'required|string|max:50',
                 'first_name' => 'required|string|max:50',
                 'middle_name' => 'nullable|string|max:50',
                 'position_id' => 'nullable|exists:positions,id',
                 'brigade_id' => 'nullable|exists:brigades,id',
+                'department_id' => 'nullable|exists:departments,id',
                 'email' => 'nullable|email|max:100|unique:employees,email',
                 'phone' => 'nullable|string|max:20',
                 'status' => 'in:active,inactive'
@@ -400,18 +454,20 @@ class EmployeeController extends Controller
             ])));
             
             $employee = Employee::create([
+                'personnel_number' => $request->personnel_number,  // Добавлено
                 'full_name' => $fullName,
                 'last_name' => $request->last_name,
                 'first_name' => $request->first_name,
                 'middle_name' => $request->middle_name,
                 'position_id' => $request->position_id,
                 'brigade_id' => $request->brigade_id,
+                'department_id' => $request->department_id,
                 'email' => $request->email,
                 'phone' => $request->phone,
                 'status' => $request->get('status', 'active')
             ]);
             
-            $employee->load(['position', 'brigade']);
+            $employee->load(['position', 'brigade', 'department']);
             
             // Формируем ответ с полным ФИО
             $responseFullName = trim(implode(' ', array_filter([
@@ -422,12 +478,15 @@ class EmployeeController extends Controller
             
             return response()->json([
                 'id' => $employee->id,
+                'personnel_number' => $employee->personnel_number,  // Добавлено
                 'full_name' => $responseFullName,
                 'last_name' => $employee->last_name,
                 'first_name' => $employee->first_name,
                 'middle_name' => $employee->middle_name,
                 'position' => $employee->position?->name ?? 'Не указана',
                 'position_id' => $employee->position_id,
+                'department' => $employee->department?->name ?? 'Не указано',
+                'department_id' => $employee->department_id,
                 'brigade' => $employee->brigade?->name ?? 'Не указана',
                 'brigade_id' => $employee->brigade_id,
                 'status' => $employee->status,
@@ -453,12 +512,13 @@ class EmployeeController extends Controller
             $employee = Employee::findOrFail($id);
             
             $validator = Validator::make($request->all(), [
-                'full_name' => 'sometimes|string|max:100',
+                'personnel_number' => 'nullable|string|max:20|unique:employees,personnel_number,' . $id,  // Добавлено
                 'last_name' => 'nullable|string|max:50',
                 'first_name' => 'nullable|string|max:50',
                 'middle_name' => 'nullable|string|max:50',
                 'position_id' => 'nullable|exists:positions,id',
                 'brigade_id' => 'nullable|exists:brigades,id',
+                'department_id' => 'nullable|exists:departments,id',
                 'email' => 'nullable|email|max:100|unique:employees,email,' . $id,
                 'phone' => 'nullable|string|max:20',
                 'status' => 'in:active,inactive'
@@ -471,14 +531,84 @@ class EmployeeController extends Controller
                 ], 422);
             }
             
-            $employee->update($request->all());
-            $employee->load(['position', 'brigade']);
+            // Обновляем табельный номер
+            if ($request->has('personnel_number')) {
+                $employee->personnel_number = $request->personnel_number;
+            }
+            
+            // Обновляем ФИО поля
+            if ($request->has('last_name')) {
+                $employee->last_name = $request->last_name;
+            }
+            if ($request->has('first_name')) {
+                $employee->first_name = $request->first_name;
+            }
+            if ($request->has('middle_name')) {
+                $employee->middle_name = $request->middle_name;
+            }
+            
+            // Пересобираем full_name если изменились ФИО поля
+            if ($request->hasAny(['last_name', 'first_name', 'middle_name'])) {
+                $fullName = trim(implode(' ', array_filter([
+                    $employee->last_name,
+                    $employee->first_name,
+                    $employee->middle_name
+                ])));
+                if (!empty($fullName)) {
+                    $employee->full_name = $fullName;
+                }
+            }
+            
+            // Обновляем остальные поля
+            if ($request->has('position_id')) {
+                $employee->position_id = $request->position_id;
+            }
+            if ($request->has('brigade_id')) {
+                $employee->brigade_id = $request->brigade_id;
+            }
+            if ($request->has('department_id')) {
+                $employee->department_id = $request->department_id;
+            }
+            if ($request->has('email')) {
+                $employee->email = $request->email;
+            }
+            if ($request->has('phone')) {
+                $employee->phone = $request->phone;
+            }
+            if ($request->has('status')) {
+                $employee->status = $request->status;
+            }
+            
+            $employee->save();
+            $employee->load(['position', 'brigade', 'department']);
+            
+            // Формируем актуальное ФИО
+            $responseFullName = trim(implode(' ', array_filter([
+                $employee->last_name,
+                $employee->first_name,
+                $employee->middle_name
+            ])));
+            
+            if (empty($responseFullName)) {
+                $responseFullName = $employee->full_name;
+            }
             
             return response()->json([
                 'id' => $employee->id,
-                'name' => $employee->full_name,
+                'personnel_number' => $employee->personnel_number,  // Добавлено
+                'full_name' => $responseFullName,
+                'last_name' => $employee->last_name,
+                'first_name' => $employee->first_name,
+                'middle_name' => $employee->middle_name,
                 'position' => $employee->position?->name ?? 'Не указана',
+                'position_id' => $employee->position_id,
+                'department' => $employee->department?->name ?? 'Не указано',
+                'department_id' => $employee->department_id,
                 'brigade' => $employee->brigade?->name ?? 'Не указана',
+                'brigade_id' => $employee->brigade_id,
+                'status' => $employee->status,
+                'email' => $employee->email,
+                'phone' => $employee->phone,
                 'updatedAt' => $employee->updated_at->toISOString()
             ], 200);
             
@@ -493,7 +623,6 @@ class EmployeeController extends Controller
             ], 500);
         }
     }
-    
     /**
      * 4.9 DELETE /employees/{id} - Удаление сотрудника
      */

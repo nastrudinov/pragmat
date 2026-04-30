@@ -348,24 +348,48 @@ class CourseController extends Controller
             $brigades = Brigade::all();
             
             // Получаем требования по должностям
-            $positionRequirements = PositionCourseRequirement::all()
-                ->groupBy('position_id')
-                ->map(function($items) {
-                    return $items->pluck('course_id', 'is_required')->toArray();
-                });
+            $positionRequirements = PositionCourseRequirement::all();
+            
+            // Создаем структуру для хранения требований
+            $requiredIdsByPosition = [];
+            $optionalIdsByPosition = [];
+            
+            foreach ($positionRequirements as $requirement) {
+                $positionId = $requirement->position_id;
+                $courseId = $requirement->course_id;
+                $isRequired = $requirement->is_required;
+                
+                if (!isset($requiredIdsByPosition[$positionId])) {
+                    $requiredIdsByPosition[$positionId] = [];
+                    $optionalIdsByPosition[$positionId] = [];
+                }
+                
+                if ($isRequired) {
+                    $requiredIdsByPosition[$positionId][] = $courseId;
+                } else {
+                    $optionalIdsByPosition[$positionId][] = $courseId;
+                }
+            }
             
             // Получаем требования по бригадам
-            $brigadeRequirements = BrigadeCourseRequirement::all()
-                ->groupBy('brigade_id')
-                ->map(function($items) {
-                    return $items->pluck('course_id')->toArray();
-                });
+            $brigadeRequirements = BrigadeCourseRequirement::all();
+            $requiredIdsByBrigade = [];
+            
+            foreach ($brigadeRequirements as $requirement) {
+                $brigadeId = $requirement->brigade_id;
+                $courseId = $requirement->course_id;
+                
+                if (!isset($requiredIdsByBrigade[$brigadeId])) {
+                    $requiredIdsByBrigade[$brigadeId] = [];
+                }
+                $requiredIdsByBrigade[$brigadeId][] = $courseId;
+            }
             
             // Формируем матрицу для должностей
-            $positionsMatrix = $positions->map(function($position) use ($courses, $positionRequirements) {
-                $positionReqs = $positionRequirements[$position->id] ?? [];
-                $requiredIds = $positionReqs[1] ?? [];
-                $optionalIds = $positionReqs[0] ?? [];
+            $positionsMatrix = $positions->map(function($position) use ($courses, $requiredIdsByPosition, $optionalIdsByPosition) {
+                $positionId = $position->id;
+                $requiredIds = $requiredIdsByPosition[$positionId] ?? [];
+                $optionalIds = $optionalIdsByPosition[$positionId] ?? [];
                 
                 $coursesData = $courses->map(function($course) use ($requiredIds, $optionalIds) {
                     $assigned = in_array($course->id, $requiredIds) || in_array($course->id, $optionalIds);
@@ -386,13 +410,14 @@ class CourseController extends Controller
                     'category' => $position->category?->name ?? 'Без категории',
                     'courses' => $coursesData,
                     'requiredCount' => count($requiredIds),
+                    'optionalCount' => count($optionalIds),
                     'totalCount' => $courses->count()
                 ];
             });
             
             // Формируем матрицу для бригад
-            $brigadesMatrix = $brigades->map(function($brigade) use ($courses, $brigadeRequirements) {
-                $requiredIds = $brigadeRequirements[$brigade->id] ?? [];
+            $brigadesMatrix = $brigades->map(function($brigade) use ($courses, $requiredIdsByBrigade) {
+                $requiredIds = $requiredIdsByBrigade[$brigade->id] ?? [];
                 
                 $coursesData = $courses->map(function($course) use ($requiredIds) {
                     return [
@@ -433,11 +458,12 @@ class CourseController extends Controller
         } catch (\Exception $e) {
             return response()->json([
                 'error' => 'Failed to fetch competence matrix',
-                'message' => $e->getMessage()
+                'message' => $e->getMessage(),
+                'line' => $e->getLine()
             ], 500);
         }
     }
-    
+        
     /**
      * 6.8 PUT /matrix/positions/{positionId}/courses/{courseId} - Назначить/отменить курс для должности
      */
