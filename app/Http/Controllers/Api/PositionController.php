@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Position;
 use App\Models\PositionCategory;
+use App\Models\Department;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
@@ -13,22 +14,22 @@ use Illuminate\Support\Facades\DB;
 class PositionController extends Controller
 {
     /**
-     * 7.1 GET /positions - Список должностей
+     * 7.1 GET /positions - Список должностей с подразделениями
      */
     public function index(Request $request)
     {
         try {
-            $query = Position::with('category');
+            $query = Position::with(['category', 'employees.department']);
             
             // Фильтр по категории
             if ($request->has('category_id')) {
                 $query->where('category_id', $request->category_id);
             }
             
-            // Фильтр по названию категории
-            if ($request->has('category_name')) {
-                $query->whereHas('category', function($q) use ($request) {
-                    $q->where('name', $request->category_name);
+            // Фильтр по подразделению (через сотрудников)
+            if ($request->has('department_id')) {
+                $query->whereHas('employees', function($q) use ($request) {
+                    $q->where('department_id', $request->department_id);
                 });
             }
             
@@ -46,12 +47,48 @@ class PositionController extends Controller
             $positions = $query->get();
             
             $formattedPositions = $positions->map(function($position) {
+                // Собираем уникальные подразделения, где есть сотрудники с этой должностью
+                $departments = $position->employees
+                    ->filter(function($employee) {
+                        return $employee->department !== null;
+                    })
+                    ->unique('department_id')
+                    ->map(function($employee) {
+                        return [
+                            'id' => $employee->department->id,
+                            'name' => $employee->department->name,
+                            'code' => $employee->department->code
+                        ];
+                    })
+                    ->values();
+                
+                // Общее количество сотрудников на этой должности
+                $employeesCount = $position->employees->count();
+                
+                // Количество сотрудников по подразделениям
+                $employeesByDepartment = $position->employees
+                    ->whereNotNull('department_id')
+                    ->groupBy('department_id')
+                    ->map(function($employees, $deptId) {
+                        $dept = $employees->first()->department;
+                        return [
+                            'department_id' => $deptId,
+                            'department_name' => $dept?->name ?? 'Без подразделения',
+                            'count' => $employees->count()
+                        ];
+                    })
+                    ->values();
+                
                 return [
                     'id' => $position->id,
                     'name' => $position->name,
                     'category' => $position->category?->name ?? 'Без категории',
                     'category_id' => $position->category_id,
-                    'employees_count' => $position->employees()->count()
+                    'departments' => $departments,  // Уникальные подразделения
+                    'employees_by_department' => $employeesByDepartment,  // Статистика по подразделениям
+                    'employees_count' => $employeesCount,
+                    'created_at' => $position->created_at?->toISOString(),
+                    'updated_at' => $position->updated_at?->toISOString()
                 ];
             });
             
@@ -100,28 +137,85 @@ class PositionController extends Controller
     }
     
     /**
-     * Получить должность по ID
+     * Получить должность по ID с подразделениями
      */
     public function show($id)
     {
         try {
-            $position = Position::with(['category', 'employees' => function($query) {
-                $query->limit(5);
-            }])->findOrFail($id);
+            $position = Position::with(['category', 'employees.department'])
+                ->findOrFail($id);
+            
+            // Собираем уникальные подразделения
+            $departments = $position->employees
+                ->filter(function($employee) {
+                    return $employee->department !== null;
+                })
+                ->unique('department_id')
+                ->map(function($employee) {
+                    return [
+                        'id' => $employee->department->id,
+                        'name' => $employee->department->name,
+                        'code' => $employee->department->code,
+                        'employees_count' => $position->employees
+                            ->where('department_id', $employee->department->id)
+                            ->count()
+                    ];
+                })
+                ->values();
+            
+            // Сотрудники по подразделениям
+            $employeesByDepartment = [];
+            foreach ($departments as $dept) {
+                $employeesByDepartment[] = [
+                    'department' => $dept,
+                    'employees' => $position->employees
+                        ->where('department_id', $dept['id'])
+                        ->map(function($employee) {
+                            $fullName = trim(implode(' ', array_filter([
+                                $employee->last_name,
+                                $employee->first_name,
+                                $employee->middle_name
+                            ])));
+                            
+                            return [
+                                'id' => $employee->id,
+                                'full_name' => $fullName ?: $employee->full_name,
+                                'status' => $employee->status,
+                                'personnel_number' => $employee->personnel_number
+                            ];
+                        })
+                        ->values()
+                ];
+            }
+            
+            // Сотрудники без подразделения
+            $employeesWithoutDepartment = $position->employees
+                ->whereNull('department_id')
+                ->map(function($employee) {
+                    $fullName = trim(implode(' ', array_filter([
+                        $employee->last_name,
+                        $employee->first_name,
+                        $employee->middle_name
+                    ])));
+                    
+                    return [
+                        'id' => $employee->id,
+                        'full_name' => $fullName ?: $employee->full_name,
+                        'status' => $employee->status,
+                        'personnel_number' => $employee->personnel_number
+                    ];
+                })
+                ->values();
             
             return response()->json([
                 'id' => $position->id,
                 'name' => $position->name,
                 'category' => $position->category?->name ?? 'Без категории',
                 'category_id' => $position->category_id,
-                'employees_count' => $position->employees()->count(),
-                'employees' => $position->employees->map(function($employee) {
-                    return [
-                        'id' => $employee->id,
-                        'name' => $employee->full_name,
-                        'status' => $employee->status
-                    ];
-                }),
+                'departments' => $departments,
+                'employees_by_department' => $employeesByDepartment,
+                'employees_without_department' => $employeesWithoutDepartment,
+                'total_employees' => $position->employees->count(),
                 'created_at' => $position->created_at?->toISOString(),
                 'updated_at' => $position->updated_at?->toISOString()
             ], 200);
@@ -296,32 +390,70 @@ class PositionController extends Controller
     }
     
     /**
-     * Получить сотрудников по должности
+     * Получить сотрудников по должности с группировкой по подразделениям
      */
     public function getEmployees($id)
     {
         try {
-            $position = Position::findOrFail($id);
+            $position = Position::with(['employees.department'])->findOrFail($id);
             
-            $employees = $position->employees()
-                ->with('brigade')
-                ->get()
+            // Группируем сотрудников по подразделениям
+            $employeesByDepartment = $position->employees
+                ->whereNotNull('department_id')
+                ->groupBy('department_id')
+                ->map(function($employees, $deptId) {
+                    $dept = $employees->first()->department;
+                    return [
+                        'department_id' => $deptId,
+                        'department_name' => $dept?->name ?? 'Без подразделения',
+                        'department_code' => $dept?->code,
+                        'employees' => $employees->map(function($employee) {
+                            $fullName = trim(implode(' ', array_filter([
+                                $employee->last_name,
+                                $employee->first_name,
+                                $employee->middle_name
+                            ])));
+                            
+                            return [
+                                'id' => $employee->id,
+                                'full_name' => $fullName ?: $employee->full_name,
+                                'personnel_number' => $employee->personnel_number,
+                                'status' => $employee->status,
+                                'email' => $employee->email,
+                                'phone' => $employee->phone
+                            ];
+                        })->values()
+                    ];
+                })
+                ->values();
+            
+            // Сотрудники без подразделения
+            $employeesWithoutDepartment = $position->employees
+                ->whereNull('department_id')
                 ->map(function($employee) {
+                    $fullName = trim(implode(' ', array_filter([
+                        $employee->last_name,
+                        $employee->first_name,
+                        $employee->middle_name
+                    ])));
+                    
                     return [
                         'id' => $employee->id,
-                        'name' => $employee->full_name,
-                        'brigade' => $employee->brigade?->name ?? 'Не указана',
+                        'full_name' => $fullName ?: $employee->full_name,
+                        'personnel_number' => $employee->personnel_number,
                         'status' => $employee->status,
                         'email' => $employee->email,
                         'phone' => $employee->phone
                     ];
-                });
+                })
+                ->values();
             
             return response()->json([
                 'position_id' => $position->id,
                 'position_name' => $position->name,
-                'total_employees' => $employees->count(),
-                'employees' => $employees
+                'total_employees' => $position->employees->count(),
+                'employees_by_department' => $employeesByDepartment,
+                'employees_without_department' => $employeesWithoutDepartment
             ], 200);
             
         } catch (ModelNotFoundException $e) {
@@ -368,6 +500,76 @@ class PositionController extends Controller
         } catch (\Exception $e) {
             return response()->json([
                 'error' => 'Failed to fetch course requirements',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+    
+    /**
+     * Получить статистику по должности с разбивкой по подразделениям
+     */
+    public function getStatistics($id)
+    {
+        try {
+            $position = Position::with(['employees.department', 'employees.employeeCourses'])
+                ->findOrFail($id);
+            
+            $totalEmployees = $position->employees->count();
+            
+            // Статистика по подразделениям
+            $departmentStats = [];
+            
+            foreach ($position->employees as $employee) {
+                if ($employee->department_id) {
+                    $deptId = $employee->department_id;
+                    $deptName = $employee->department?->name ?? 'Без подразделения';
+                    
+                    if (!isset($departmentStats[$deptId])) {
+                        $departmentStats[$deptId] = [
+                            'department_id' => $deptId,
+                            'department_name' => $deptName,
+                            'total' => 0,
+                            'compliant' => 0,
+                            'non_compliant' => 0
+                        ];
+                    }
+                    
+                    $departmentStats[$deptId]['total']++;
+                    
+                    // Проверяем соответствие (нет просроченных курсов)
+                    $hasExpired = $employee->employeeCourses->contains('status', 'expired');
+                    if (!$hasExpired) {
+                        $departmentStats[$deptId]['compliant']++;
+                    } else {
+                        $departmentStats[$deptId]['non_compliant']++;
+                    }
+                }
+            }
+            
+            // Общая статистика
+            $compliantEmployees = $position->employees->filter(function($employee) {
+                return !$employee->employeeCourses->contains('status', 'expired');
+            })->count();
+            
+            return response()->json([
+                'position_id' => $position->id,
+                'position_name' => $position->name,
+                'total_employees' => $totalEmployees,
+                'compliant_employees' => $compliantEmployees,
+                'non_compliant_employees' => $totalEmployees - $compliantEmployees,
+                'compliance_percentage' => $totalEmployees > 0 
+                    ? round(($compliantEmployees / $totalEmployees) * 100)
+                    : 0,
+                'by_department' => array_values($departmentStats)
+            ], 200);
+            
+        } catch (ModelNotFoundException $e) {
+            return response()->json([
+                'error' => 'Position not found'
+            ], 404);
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => 'Failed to fetch statistics',
                 'message' => $e->getMessage()
             ], 500);
         }

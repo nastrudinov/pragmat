@@ -12,24 +12,27 @@ class Position extends Model
         'name',
         'category_id'
     ];
-
-    protected $casts = [
-        'created_at' => 'datetime',
-        'updated_at' => 'datetime',
-    ];
-
+    
     public function category(): BelongsTo
     {
         return $this->belongsTo(PositionCategory::class, 'category_id');
     }
-
+    
     public function employees(): HasMany
     {
         return $this->hasMany(Employee::class);
     }
-
+    
     public function courseRequirements(): HasMany
     {
         return $this->hasMany(PositionCourseRequirement::class);
+    }
+    
+    // Получить все подразделения, где есть сотрудники с этой должностью
+    public function getDepartmentsAttribute()
+    {
+        return Department::whereHas('employees', function($query) {
+            $query->where('position_id', $this->id);
+        })->get();
     }
 }

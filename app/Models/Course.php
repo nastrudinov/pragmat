@@ -11,6 +11,10 @@ class Course extends Model
     protected $fillable = [
         'name',
         'category_id',
+        'subcategory',      // Добавлено
+        'type',             // Добавлено
+        'legal_basis',      // Добавлено
+        'direction',        // Добавлено
         'duration_hours',
         'periodicity_months',
         'description'

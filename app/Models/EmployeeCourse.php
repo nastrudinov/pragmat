@@ -17,23 +17,25 @@ class EmployeeCourse extends Model
         'completed_date',
         'expiration_date',
         'certificate_file_path',
+        'certificate_number',      // Добавлено
+        'regulatory_acts',          // Добавлено
         'last_reminder_sent'
     ];
 
     protected $casts = [
-        'assigned_date' => 'date',
-        'completed_date' => 'date',
-        'expiration_date' => 'date',
+        'assigned_date' => 'datetime',
+        'completed_date' => 'datetime',
+        'expiration_date' => 'datetime',
         'last_reminder_sent' => 'date',
         'created_at' => 'datetime',
         'updated_at' => 'datetime',
     ];
-
+    
     public function employee(): BelongsTo
     {
         return $this->belongsTo(Employee::class);
     }
-
+    
     public function course(): BelongsTo
     {
         return $this->belongsTo(Course::class);

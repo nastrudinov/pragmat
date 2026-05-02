@@ -159,13 +159,13 @@ class TrainingController extends Controller
     /**
      * 2.3 GET /trainings/{id} - Детали обучения
      */
-    public function show($id)
+   public function show($id)
     {
         try {
             $training = EmployeeCourse::with(['employee.position', 'employee.brigade', 'course'])
                 ->findOrFail($id);
             
-            // История изменений (имитация, можно расширить с таблицей истории)
+            // История изменений
             $history = $this->getTrainingHistory($training);
             
             $response = [
@@ -184,6 +184,8 @@ class TrainingController extends Controller
                 'expiresDate' => $training->expiration_date?->format('Y-m-d'),
                 'status' => $training->status,
                 'certificateUrl' => $training->certificate_file_path,
+                'certificateNumber' => $training->certificate_number,      // Добавлено
+                'regulatoryActs' => $training->regulatory_acts,            // Добавлено
                 'history' => $history,
                 'lastReminderSent' => $training->last_reminder_sent?->format('Y-m-d')
             ];
@@ -226,7 +228,9 @@ class TrainingController extends Controller
                         'daysLeft' => $training->expiration_date 
                             ? now()->diffInDays($training->expiration_date, false) 
                             : null,
-                        'certificateUrl' => $training->certificate_file_path
+                        'certificateUrl' => $training->certificate_file_path,
+                        'certificateNumber' => $training->certificate_number,    // Добавлено
+                        'regulatoryActs' => $training->regulatory_acts           // Добавлено
                     ];
                 });
             
@@ -336,6 +340,8 @@ class TrainingController extends Controller
             
             $validator = Validator::make($request->all(), [
                 'certificate_file' => 'nullable|file|mimes:pdf,jpg,jpeg,png|max:5120',
+                'certificate_number' => 'nullable|string|max:100',  // Добавлено
+                'regulatory_acts' => 'nullable|string',             // Добавлено
                 'completed_date' => 'nullable|date'
             ]);
             
@@ -360,12 +366,29 @@ class TrainingController extends Controller
             // Рассчитываем новую дату истечения
             $course = $training->course;
             $periodicityMonths = $course?->periodicity_months ?? 12;
-            $newExpirationDate = now()->addMonths($periodicityMonths);
             
+            // Преобразуем дату завершения
+            $completedDate = $request->has('completed_date')
+                ? \Carbon\Carbon::parse($request->completed_date)
+                : now();
+            
+            $newExpirationDate = $completedDate->copy()->addMonths($periodicityMonths);
+            
+            // Обновляем запись
             $training->status = 'active';
-            $training->completed_date = $request->get('completed_date', now());
+            $training->completed_date = $completedDate;
             $training->expiration_date = $newExpirationDate;
             $training->certificate_file_path = $certificatePath;
+            
+            // Добавляем новые поля
+            if ($request->has('certificate_number')) {
+                $training->certificate_number = $request->certificate_number;
+            }
+            
+            if ($request->has('regulatory_acts')) {
+                $training->regulatory_acts = $request->regulatory_acts;
+            }
+            
             $training->save();
             
             DB::commit();
@@ -373,17 +396,21 @@ class TrainingController extends Controller
             return response()->json([
                 'success' => true,
                 'message' => 'Обучение отмечено как пройденное',
-                'completedDate' => $training->completed_date->format('Y-m-d'),
-                'newExpiresDate' => $newExpirationDate->format('Y-m-d')
+                'completedDate' => $completedDate->format('Y-m-d'),
+                'newExpiresDate' => $newExpirationDate->format('Y-m-d'),
+                'certificate_number' => $training->certificate_number,
+                'regulatory_acts' => $training->regulatory_acts
             ], 200);
             
         } catch (ModelNotFoundException $e) {
+            DB::rollBack();
             return response()->json([
                 'success' => false,
                 'message' => 'Training not found'
             ], 404);
         } catch (\Exception $e) {
             DB::rollBack();
+            \Log::error('Complete training error: ' . $e->getMessage());
             return response()->json([
                 'success' => false,
                 'message' => 'Failed to complete training',
@@ -412,27 +439,41 @@ class TrainingController extends Controller
                 ], 422);
             }
             
+            // Сохраняем старую дату до обновления
+            $oldExpirationDate = $training->expiration_date;
+            
             // Рассчитываем новую дату истечения
             if ($request->has('new_expiration_date')) {
-                $newExpirationDate = $request->new_expiration_date;
+                // Преобразуем строку в объект Carbon
+                $newExpirationDate = \Carbon\Carbon::parse($request->new_expiration_date);
             } else {
                 $months = $request->get('months', 12);
                 $newExpirationDate = now()->addMonths($months);
             }
             
-            $oldExpirationDate = $training->expiration_date;
+            // Обновляем запись
             $training->expiration_date = $newExpirationDate;
             $training->status = 'active';
             $training->save();
             
+            // Рассчитываем количество дней до истечения
             $daysLeft = now()->diffInDays($newExpirationDate, false);
+            
+            // Форматируем даты для ответа, проверяя их наличие
+            $formattedOldDate = null;
+            if ($oldExpirationDate) {
+                // Если oldExpirationDate уже Carbon объект, используем его, иначе парсим
+                $formattedOldDate = $oldExpirationDate instanceof \Carbon\Carbon 
+                    ? $oldExpirationDate->format('Y-m-d')
+                    : \Carbon\Carbon::parse($oldExpirationDate)->format('Y-m-d');
+            }
             
             return response()->json([
                 'success' => true,
                 'message' => 'Срок продлен',
                 'newExpiresDate' => $newExpirationDate->format('Y-m-d'),
                 'daysLeft' => max(0, $daysLeft),
-                'oldExpiresDate' => $oldExpirationDate?->format('Y-m-d')
+                'oldExpiresDate' => $formattedOldDate
             ], 200);
             
         } catch (ModelNotFoundException $e) {
@@ -441,6 +482,7 @@ class TrainingController extends Controller
                 'message' => 'Training not found'
             ], 404);
         } catch (\Exception $e) {
+            \Log::error('Extend training error: ' . $e->getMessage());
             return response()->json([
                 'success' => false,
                 'message' => 'Failed to extend training',
@@ -484,12 +526,16 @@ class TrainingController extends Controller
             
             $course = Course::find($request->course_id);
             
-            // Рассчитываем дату истечения
-            $assignedDate = $request->get('assigned_date', now());
-            $expirationDate = $request->get('expiration_date');
+            // Обработка дат - преобразуем строки в объекты Carbon
+            $assignedDate = $request->has('assigned_date') 
+                ? \Carbon\Carbon::parse($request->assigned_date) 
+                : now();
             
-            if (!$expirationDate && $course && $course->periodicity_months) {
-                $expirationDate = now()->addMonths($course->periodicity_months);
+            $expirationDate = null;
+            if ($request->has('expiration_date')) {
+                $expirationDate = \Carbon\Carbon::parse($request->expiration_date);
+            } elseif ($course && $course->periodicity_months) {
+                $expirationDate = $assignedDate->copy()->addMonths($course->periodicity_months);
             }
             
             $training = EmployeeCourse::create([
@@ -508,16 +554,20 @@ class TrainingController extends Controller
                 $needsAttention = $daysLeft <= 30 && $daysLeft >= 0;
             }
             
+            // Форматируем даты для ответа
+            $formattedExpirationDate = $expirationDate ? $expirationDate->format('Y-m-d') : null;
+            
             return response()->json([
                 'success' => true,
                 'message' => 'Обучение назначено',
                 'trainingId' => $training->id,
                 'employeeId' => $training->employee_id,
-                'expiresDate' => $expirationDate?->format('Y-m-d'),
+                'expiresDate' => $formattedExpirationDate,
                 'needsAttention' => $needsAttention
             ], 201);
             
         } catch (\Exception $e) {
+            \Log::error('Assign training error: ' . $e->getMessage());
             return response()->json([
                 'success' => false,
                 'message' => 'Failed to assign training',

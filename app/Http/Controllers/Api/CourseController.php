@@ -29,9 +29,27 @@ class CourseController extends Controller
                 $query->where('category_id', $request->category_id);
             }
             
+            // Фильтр по подкатегории
+            if ($request->has('subcategory')) {
+                $query->where('subcategory', $request->subcategory);
+            }
+            
+            // Фильтр по типу
+            if ($request->has('type')) {
+                $query->where('type', $request->type);
+            }
+            
+            // Фильтр по направлению
+            if ($request->has('direction')) {
+                $query->where('direction', $request->direction);
+            }
+            
             // Поиск по названию
             if ($request->has('search')) {
-                $query->where('name', 'LIKE', "%{$request->search}%");
+                $search = $request->search;
+                $query->where('name', 'LIKE', "%{$search}%")
+                    ->orWhere('subcategory', 'LIKE', "%{$search}%")
+                    ->orWhere('direction', 'LIKE', "%{$search}%");
             }
             
             // Сортировка
@@ -47,6 +65,10 @@ class CourseController extends Controller
                     'name' => $course->name,
                     'category' => $course->category?->name ?? 'Без категории',
                     'category_id' => $course->category_id,
+                    'subcategory' => $course->subcategory,      // Добавлено
+                    'type' => $course->type,                    // Добавлено
+                    'legal_basis' => $course->legal_basis,      // Добавлено
+                    'direction' => $course->direction,          // Добавлено
                     'duration' => $course->duration_hours ? $course->duration_hours . ' часов' : 'Не указано',
                     'duration_hours' => $course->duration_hours,
                     'periodicity' => $course->periodicity_months ? $course->periodicity_months . ' ' . $this->getPeriodicityText($course->periodicity_months) : 'Не указано',
@@ -86,12 +108,33 @@ class CourseController extends Controller
                     ];
                 });
             
+            // Получаем уникальные подкатегории, типы и направления
+            $subcategories = Course::whereNotNull('subcategory')
+                ->distinct()
+                ->pluck('subcategory')
+                ->values();
+            
+            $types = Course::whereNotNull('type')
+                ->distinct()
+                ->pluck('type')
+                ->values();
+            
+            $directions = Course::whereNotNull('direction')
+                ->distinct()
+                ->pluck('direction')
+                ->values();
+            
             // Для обратной совместимости с примером ответа
             $categoryNames = $categories->pluck('name')->toArray();
             
             return response()->json([
                 'categories' => $categoryNames,
-                'categories_with_details' => $categories
+                'categories_with_details' => $categories,
+                'filters' => [
+                    'subcategories' => $subcategories,
+                    'types' => $types,
+                    'directions' => $directions
+                ]
             ], 200);
             
         } catch (\Exception $e) {
@@ -117,6 +160,9 @@ class CourseController extends Controller
                     return [
                         'courseId' => $requirement->course_id,
                         'name' => $requirement->course?->name ?? 'Неизвестный курс',
+                        'subcategory' => $requirement->course?->subcategory,
+                        'type' => $requirement->course?->type,
+                        'direction' => $requirement->course?->direction,
                         'isRequired' => $requirement->is_required,
                         'duration_hours' => $requirement->course?->duration_hours,
                         'periodicity_months' => $requirement->course?->periodicity_months
@@ -133,6 +179,9 @@ class CourseController extends Controller
                 return [
                     'courseId' => $course->id,
                     'name' => $course->name,
+                    'subcategory' => $course->subcategory,
+                    'type' => $course->type,
+                    'direction' => $course->direction,
                     'isRequired' => false,
                     'duration_hours' => $course->duration_hours,
                     'periodicity_months' => $course->periodicity_months
@@ -170,6 +219,10 @@ class CourseController extends Controller
                 'name' => 'required|string|max:100|unique:courses,name',
                 'category_id' => 'nullable|exists:course_categories,id',
                 'category_name' => 'nullable|string|max:50',
+                'subcategory' => 'nullable|string|max:100',      // Добавлено
+                'type' => 'nullable|string|max:50',              // Добавлено
+                'legal_basis' => 'nullable|string',              // Добавлено
+                'direction' => 'nullable|string|max:100',        // Добавлено
                 'duration_hours' => 'nullable|integer|min:1|max:1000',
                 'periodicity_months' => 'nullable|integer|min:1|max:120',
                 'description' => 'nullable|string'
@@ -195,6 +248,10 @@ class CourseController extends Controller
             $course = Course::create([
                 'name' => $request->name,
                 'category_id' => $categoryId,
+                'subcategory' => $request->subcategory,      // Добавлено
+                'type' => $request->type,                    // Добавлено
+                'legal_basis' => $request->legal_basis,      // Добавлено
+                'direction' => $request->direction,          // Добавлено
                 'duration_hours' => $request->duration_hours,
                 'periodicity_months' => $request->periodicity_months,
                 'description' => $request->description
@@ -206,6 +263,10 @@ class CourseController extends Controller
                 'id' => $course->id,
                 'name' => $course->name,
                 'category' => $course->category?->name ?? 'Без категории',
+                'subcategory' => $course->subcategory,      // Добавлено
+                'type' => $course->type,                    // Добавлено
+                'legal_basis' => $course->legal_basis,      // Добавлено
+                'direction' => $course->direction,          // Добавлено
                 'duration' => $course->duration_hours ? $course->duration_hours . ' часов' : 'Не указано',
                 'periodicity' => $course->periodicity_months ? $course->periodicity_months . ' ' . $this->getPeriodicityText($course->periodicity_months) : 'Не указано',
                 'description' => $course->description,
@@ -232,6 +293,10 @@ class CourseController extends Controller
                 'name' => 'sometimes|string|max:100|unique:courses,name,' . $id,
                 'category_id' => 'nullable|exists:course_categories,id',
                 'category_name' => 'nullable|string|max:50',
+                'subcategory' => 'nullable|string|max:100',      // Добавлено
+                'type' => 'nullable|string|max:50',              // Добавлено
+                'legal_basis' => 'nullable|string',              // Добавлено
+                'direction' => 'nullable|string|max:100',        // Добавлено
                 'duration_hours' => 'nullable|integer|min:1|max:1000',
                 'periodicity_months' => 'nullable|integer|min:1|max:120',
                 'description' => 'nullable|string'
@@ -260,14 +325,25 @@ class CourseController extends Controller
                 $course->category_id = $category->id;
             }
             
+            // Обновляем новые поля
+            if ($request->has('subcategory')) {
+                $course->subcategory = $request->subcategory;
+            }
+            if ($request->has('type')) {
+                $course->type = $request->type;
+            }
+            if ($request->has('legal_basis')) {
+                $course->legal_basis = $request->legal_basis;
+            }
+            if ($request->has('direction')) {
+                $course->direction = $request->direction;
+            }
             if ($request->has('duration_hours')) {
                 $course->duration_hours = $request->duration_hours;
             }
-            
             if ($request->has('periodicity_months')) {
                 $course->periodicity_months = $request->periodicity_months;
             }
-            
             if ($request->has('description')) {
                 $course->description = $request->description;
             }
@@ -279,6 +355,10 @@ class CourseController extends Controller
                 'id' => $course->id,
                 'name' => $course->name,
                 'category' => $course->category?->name ?? 'Без категории',
+                'subcategory' => $course->subcategory,      // Добавлено
+                'type' => $course->type,                    // Добавлено
+                'legal_basis' => $course->legal_basis,      // Добавлено
+                'direction' => $course->direction,          // Добавлено
                 'duration' => $course->duration_hours ? $course->duration_hours . ' часов' : 'Не указано',
                 'periodicity' => $course->periodicity_months ? $course->periodicity_months . ' ' . $this->getPeriodicityText($course->periodicity_months) : 'Не указано',
                 'updatedAt' => $course->updated_at->toISOString()
@@ -338,6 +418,41 @@ class CourseController extends Controller
     }
     
     /**
+     * GET /courses/filters - Получить доступные фильтры для курсов
+     */
+    public function getFilters()
+    {
+        try {
+            $subcategories = Course::whereNotNull('subcategory')
+                ->distinct()
+                ->pluck('subcategory')
+                ->values();
+            
+            $types = Course::whereNotNull('type')
+                ->distinct()
+                ->pluck('type')
+                ->values();
+            
+            $directions = Course::whereNotNull('direction')
+                ->distinct()
+                ->pluck('direction')
+                ->values();
+            
+            return response()->json([
+                'subcategories' => $subcategories,
+                'types' => $types,
+                'directions' => $directions
+            ], 200);
+            
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => 'Failed to fetch filters',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+    
+        /**
      * 6.7 GET /matrix/positions - Матрица компетенций (должности)
      */
     public function getCompetenceMatrix()
@@ -348,48 +463,36 @@ class CourseController extends Controller
             $brigades = Brigade::all();
             
             // Получаем требования по должностям
-            $positionRequirements = PositionCourseRequirement::all();
-            
-            // Создаем структуру для хранения требований
-            $requiredIdsByPosition = [];
-            $optionalIdsByPosition = [];
-            
-            foreach ($positionRequirements as $requirement) {
-                $positionId = $requirement->position_id;
-                $courseId = $requirement->course_id;
-                $isRequired = $requirement->is_required;
-                
-                if (!isset($requiredIdsByPosition[$positionId])) {
-                    $requiredIdsByPosition[$positionId] = [];
-                    $optionalIdsByPosition[$positionId] = [];
-                }
-                
-                if ($isRequired) {
-                    $requiredIdsByPosition[$positionId][] = $courseId;
-                } else {
-                    $optionalIdsByPosition[$positionId][] = $courseId;
-                }
-            }
+            $positionRequirements = PositionCourseRequirement::all()
+                ->groupBy('position_id')
+                ->map(function($items) {
+                    $requiredIds = [];
+                    $optionalIds = [];
+                    foreach ($items as $item) {
+                        if ($item->is_required) {
+                            $requiredIds[] = $item->course_id;
+                        } else {
+                            $optionalIds[] = $item->course_id;
+                        }
+                    }
+                    return [
+                        'required' => $requiredIds,
+                        'optional' => $optionalIds
+                    ];
+                });
             
             // Получаем требования по бригадам
-            $brigadeRequirements = BrigadeCourseRequirement::all();
-            $requiredIdsByBrigade = [];
-            
-            foreach ($brigadeRequirements as $requirement) {
-                $brigadeId = $requirement->brigade_id;
-                $courseId = $requirement->course_id;
-                
-                if (!isset($requiredIdsByBrigade[$brigadeId])) {
-                    $requiredIdsByBrigade[$brigadeId] = [];
-                }
-                $requiredIdsByBrigade[$brigadeId][] = $courseId;
-            }
+            $brigadeRequirements = BrigadeCourseRequirement::all()
+                ->groupBy('brigade_id')
+                ->map(function($items) {
+                    return $items->pluck('course_id')->toArray();
+                });
             
             // Формируем матрицу для должностей
-            $positionsMatrix = $positions->map(function($position) use ($courses, $requiredIdsByPosition, $optionalIdsByPosition) {
-                $positionId = $position->id;
-                $requiredIds = $requiredIdsByPosition[$positionId] ?? [];
-                $optionalIds = $optionalIdsByPosition[$positionId] ?? [];
+            $positionsMatrix = $positions->map(function($position) use ($courses, $positionRequirements) {
+                $positionReqs = $positionRequirements[$position->id] ?? ['required' => [], 'optional' => []];
+                $requiredIds = $positionReqs['required'];
+                $optionalIds = $positionReqs['optional'];
                 
                 $coursesData = $courses->map(function($course) use ($requiredIds, $optionalIds) {
                     $assigned = in_array($course->id, $requiredIds) || in_array($course->id, $optionalIds);
@@ -399,6 +502,9 @@ class CourseController extends Controller
                         'courseId' => $course->id,
                         'name' => $course->name,
                         'category' => $course->category?->name,
+                        'subcategory' => $course->subcategory,
+                        'type' => $course->type,
+                        'direction' => $course->direction,
                         'assigned' => $assigned,
                         'isRequired' => $isRequired
                     ];
@@ -410,20 +516,22 @@ class CourseController extends Controller
                     'category' => $position->category?->name ?? 'Без категории',
                     'courses' => $coursesData,
                     'requiredCount' => count($requiredIds),
-                    'optionalCount' => count($optionalIds),
                     'totalCount' => $courses->count()
                 ];
             });
             
             // Формируем матрицу для бригад
-            $brigadesMatrix = $brigades->map(function($brigade) use ($courses, $requiredIdsByBrigade) {
-                $requiredIds = $requiredIdsByBrigade[$brigade->id] ?? [];
+            $brigadesMatrix = $brigades->map(function($brigade) use ($courses, $brigadeRequirements) {
+                $requiredIds = $brigadeRequirements[$brigade->id] ?? [];
                 
                 $coursesData = $courses->map(function($course) use ($requiredIds) {
                     return [
                         'courseId' => $course->id,
                         'name' => $course->name,
                         'category' => $course->category?->name,
+                        'subcategory' => $course->subcategory,
+                        'type' => $course->type,
+                        'direction' => $course->direction,
                         'assigned' => in_array($course->id, $requiredIds)
                     ];
                 });
@@ -444,7 +552,10 @@ class CourseController extends Controller
                         'id' => $course->id,
                         'name' => $course->name,
                         'category' => $course->category?->name,
-                        'categoryId' => $course->category_id
+                        'categoryId' => $course->category_id,
+                        'subcategory' => $course->subcategory,
+                        'type' => $course->type,
+                        'direction' => $course->direction
                     ];
                 }),
                 'categories' => CourseCategory::orderBy('sort_order')->get(),
@@ -458,12 +569,11 @@ class CourseController extends Controller
         } catch (\Exception $e) {
             return response()->json([
                 'error' => 'Failed to fetch competence matrix',
-                'message' => $e->getMessage(),
-                'line' => $e->getLine()
+                'message' => $e->getMessage()
             ], 500);
         }
     }
-        
+    
     /**
      * 6.8 PUT /matrix/positions/{positionId}/courses/{courseId} - Назначить/отменить курс для должности
      */
@@ -600,7 +710,7 @@ class CourseController extends Controller
             ], 500);
         }
     }
-    
+
     /**
      * Получить детали курса
      */
@@ -627,6 +737,10 @@ class CourseController extends Controller
                 'name' => $course->name,
                 'category' => $course->category?->name ?? 'Без категории',
                 'category_id' => $course->category_id,
+                'subcategory' => $course->subcategory,      // Добавлено
+                'type' => $course->type,                    // Добавлено
+                'legal_basis' => $course->legal_basis,      // Добавлено
+                'direction' => $course->direction,          // Добавлено
                 'duration_hours' => $course->duration_hours,
                 'periodicity_months' => $course->periodicity_months,
                 'description' => $course->description,
