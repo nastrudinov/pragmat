@@ -3,6 +3,8 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\Employee; 
+use App\Models\EmployeeCourse; 
 use App\Models\Course;
 use App\Models\CourseCategory;
 use App\Models\Position;
@@ -597,7 +599,7 @@ class CourseController extends Controller
             $assigned = $request->assigned;
             $isRequired = $request->get('is_required', true);
             
-            if ($assigned) {
+            if ($assigned && $isRequired) {
                 // Назначаем курс
                 $requirement = PositionCourseRequirement::updateOrCreate(
                     [
@@ -608,7 +610,7 @@ class CourseController extends Controller
                         'is_required' => $isRequired
                     ]
                 );
-                
+                $this->autoAssignCourseToPositionEmployees($positionId, $courseId);
                 $message = "Курс назначен должности";
             } else {
                 // Отменяем курс
@@ -643,6 +645,39 @@ class CourseController extends Controller
             ], 500);
         }
     }
+
+    private function autoAssignCourseToPositionEmployees($positionId, $courseId)
+{
+    try {
+        $employees = Employee::where('position_id', $positionId)
+            ->where('status', 'active')
+            ->get();
+        
+        $course = Course::find($courseId);
+        $assignedDate = now();
+        $expirationDate = $course && $course->periodicity_months 
+            ? $assignedDate->copy()->addMonths($course->periodicity_months)
+            : null;
+        
+        foreach ($employees as $employee) {
+            $existing = EmployeeCourse::where('employee_id', $employee->id)
+                ->where('course_id', $courseId)
+                ->first();
+            
+            if (!$existing) {
+                EmployeeCourse::create([
+                    'employee_id' => $employee->id,
+                    'course_id' => $courseId,
+                    'status' => 'required',
+                    'assigned_date' => $assignedDate,
+                    'expiration_date' => $expirationDate
+                ]);
+            }
+        }
+    } catch (\Exception $e) {
+        \Log::error('Auto assign course error: ' . $e->getMessage());
+    }
+}
     
     /**
      * 6.9 PUT /matrix/brigades/{brigadeId}/courses/{courseId} - Назначить/отменить курс для бригады

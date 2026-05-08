@@ -111,6 +111,29 @@ Route::prefix('trainings')->group(function () {
     Route::get('/{id}', [TrainingController::class, 'show']);                            // 2.3
     Route::put('/{id}/complete', [TrainingController::class, 'completeTraining']);       // 2.6
     Route::put('/{id}/extend', [TrainingController::class, 'extendTraining']);           // 2.7
+
+    // Новые роуты для обновления НПА и номера удостоверения
+    Route::put('/{id}/certificate', [TrainingController::class, 'updateCertificateInfo']);  // Обновление сертификата
+    Route::patch('/{id}/certificate-number', [TrainingController::class, 'updateCertificateNumber']); // Только номер
+    Route::patch('/{id}/regulatory-acts', [TrainingController::class, 'updateRegulatoryActs']); // Только НПА
+     // Маршруты для карточек дашборда
+    Route::prefix('dashboard')->group(function () {
+        // Просроченные с фильтром по периоду
+        Route::get('/expired-by-course', [TrainingController::class, 'getExpiredByCourse']);
+        
+        // Истекающие по периодам (month / two_months)
+        Route::get('/expiring-by-period', [TrainingController::class, 'getExpiringByPeriod']);
+        
+        // Для обратной совместимости
+        Route::get('/expiring-in-month', [TrainingController::class, 'getExpiringInMonth']);
+        Route::get('/expiring-in-two-months', [TrainingController::class, 'getExpiringInTwoMonths']);
+        Route::get('/summary', [TrainingController::class, 'getDashboardSummary']);
+    });
+
+     // Массовое назначение курсов
+    Route::post('/assign-to-position', [TrainingController::class, 'assignToPosition']);
+    Route::post('/assign-to-brigade', [TrainingController::class, 'assignToBrigade']);
+    Route::post('/assign-to-department', [TrainingController::class, 'assignToDepartment']);
 });
 
 // Маршруты для тепловой карты
