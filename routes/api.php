@@ -11,6 +11,7 @@ use App\Http\Controllers\Api\TrainingController;
 use App\Http\Controllers\Api\HeatMapController;
 use App\Http\Controllers\Api\CourseController;
 use App\Http\Controllers\Api\DepartmentController;
+use App\Http\Controllers\Api\TrainingEventController;
 
 // Маршруты для подразделений (требуют аутентификации)
 
@@ -23,8 +24,6 @@ use App\Http\Controllers\Api\DepartmentController;
         Route::put('/{id}', [DepartmentController::class, 'update']);              // PUT /departments/{id}
         Route::delete('/{id}', [DepartmentController::class, 'destroy']);          // DELETE /departments/{id}
     });
-
-
 
 // Маршруты для сотрудников
 Route::prefix('employees')->group(function () {
@@ -96,44 +95,43 @@ Route::prefix('notifications')->group(function () {
 
 // Маршруты для обучений
 Route::prefix('trainings')->group(function () {
-    Route::get('/expired', [TrainingController::class, 'getExpiredTrainings']);           // 2.1
-    Route::get('/expiring/{days}', [TrainingController::class, 'getExpiringTrainings']); // 2.2
-    Route::get('/statistics', [TrainingController::class, 'getStatistics']);             // 2.10
-    Route::get('/export', [TrainingController::class, 'export']);                        // 2.11
-    Route::get('/search', [TrainingController::class, 'search']);                        // 2.12
+    // ===== СПЕЦИФИЧНЫЕ СТАТИЧЕСКИЕ РОУТЫ (ДОЛЖНЫ БЫТЬ ПЕРВЫМИ) =====
+    Route::get('/employee-courses-summary', [TrainingController::class, 'getEmployeeCoursesSummary']);
+    Route::get('/expired', [TrainingController::class, 'getExpiredTrainings']);
+    Route::get('/expiring/{days}', [TrainingController::class, 'getExpiringTrainings']);
+    Route::get('/statistics', [TrainingController::class, 'getStatistics']);
+    Route::get('/export', [TrainingController::class, 'export']);
+    Route::get('/search', [TrainingController::class, 'search']);
     
-    Route::get('/employee/{employeeId}', [TrainingController::class, 'getEmployeeTrainings']); // 2.4
-    Route::get('/brigade/{brigadeId}', [TrainingController::class, 'getBrigadeTrainings']);   // 2.5
+    // ===== РОУТЫ С ПАРАМЕТРАМИ =====
+    Route::get('/employee/{employeeId}', [TrainingController::class, 'getEmployeeTrainings']);
+    Route::get('/brigade/{brigadeId}', [TrainingController::class, 'getBrigadeTrainings']);
     
-    Route::post('/assign', [TrainingController::class, 'assignTraining']);               // 2.8
-    Route::post('/bulk-assign', [TrainingController::class, 'bulkAssign']);              // 2.9
+    // ===== МАССОВОЕ НАЗНАЧЕНИЕ =====
+    Route::post('/assign-to-position', [TrainingController::class, 'assignToPosition']);
+    Route::post('/assign-to-brigade', [TrainingController::class, 'assignToBrigade']);
+    Route::post('/assign-to-department', [TrainingController::class, 'assignToDepartment']);
     
-    Route::get('/{id}', [TrainingController::class, 'show']);                            // 2.3
-    Route::put('/{id}/complete', [TrainingController::class, 'completeTraining']);       // 2.6
-    Route::put('/{id}/extend', [TrainingController::class, 'extendTraining']);           // 2.7
-
-    // Новые роуты для обновления НПА и номера удостоверения
-    Route::put('/{id}/certificate', [TrainingController::class, 'updateCertificateInfo']);  // Обновление сертификата
-    Route::patch('/{id}/certificate-number', [TrainingController::class, 'updateCertificateNumber']); // Только номер
-    Route::patch('/{id}/regulatory-acts', [TrainingController::class, 'updateRegulatoryActs']); // Только НПА
-     // Маршруты для карточек дашборда
+    // ===== POST РОУТЫ =====
+    Route::post('/assign', [TrainingController::class, 'assignTraining']);
+    Route::post('/bulk-assign', [TrainingController::class, 'bulkAssign']);
+    
+    // ===== DASHBOARD РОУТЫ =====
     Route::prefix('dashboard')->group(function () {
-        // Просроченные с фильтром по периоду
         Route::get('/expired-by-course', [TrainingController::class, 'getExpiredByCourse']);
-        
-        // Истекающие по периодам (month / two_months)
         Route::get('/expiring-by-period', [TrainingController::class, 'getExpiringByPeriod']);
-        
-        // Для обратной совместимости
         Route::get('/expiring-in-month', [TrainingController::class, 'getExpiringInMonth']);
         Route::get('/expiring-in-two-months', [TrainingController::class, 'getExpiringInTwoMonths']);
         Route::get('/summary', [TrainingController::class, 'getDashboardSummary']);
     });
-
-     // Массовое назначение курсов
-    Route::post('/assign-to-position', [TrainingController::class, 'assignToPosition']);
-    Route::post('/assign-to-brigade', [TrainingController::class, 'assignToBrigade']);
-    Route::post('/assign-to-department', [TrainingController::class, 'assignToDepartment']);
+    
+    // ===== РОУТЫ С {ID} - ДОЛЖНЫ БЫТЬ ПОСЛЕДНИМИ =====
+    Route::get('/{id}', [TrainingController::class, 'show']);
+    Route::put('/{id}/complete', [TrainingController::class, 'completeTraining']);
+    Route::put('/{id}/extend', [TrainingController::class, 'extendTraining']);
+    Route::put('/{id}/certificate', [TrainingController::class, 'updateCertificateInfo']);
+    Route::patch('/{id}/certificate-number', [TrainingController::class, 'updateCertificateNumber']);
+    Route::patch('/{id}/regulatory-acts', [TrainingController::class, 'updateRegulatoryActs']);
 });
 
 // Маршруты для тепловой карты
@@ -157,6 +155,8 @@ Route::prefix('courses')->group(function () {
     Route::get('/{id}', [CourseController::class, 'show']);
     Route::put('/{id}', [CourseController::class, 'update']);
     Route::delete('/{id}', [CourseController::class, 'destroy']);
+    Route::get('/{courseId}/events', [CourseController::class, 'getCourseEvents']);
+    Route::get('/{courseId}/employees', [CourseController::class, 'getCourseEmployees']);
 });
 
 // Маршруты для матрицы компетенций
@@ -164,6 +164,25 @@ Route::prefix('matrix')->group(function () {
     Route::get('/positions', [CourseController::class, 'getCompetenceMatrix']);   // 6.7 GET /matrix/positions
     Route::put('/positions/{positionId}/courses/{courseId}', [CourseController::class, 'assignCourseToPosition']); // 6.8 PUT /matrix/positions/{positionId}/courses/{courseId}
     Route::put('/brigades/{brigadeId}/courses/{courseId}', [CourseController::class, 'assignCourseToBrigade']);   // 6.9 PUT /matrix/brigades/{brigadeId}/courses/{courseId}
+});
+
+// Маршруты для мероприятий
+Route::prefix('training-events')->group(function () {
+    Route::get('/', [TrainingEventController::class, 'index']);           // Список мероприятий
+    Route::get('/calendar', [TrainingEventController::class, 'calendar']); // Данные для календаря
+    Route::post('/', [TrainingEventController::class, 'store']);          // Создание
+    Route::get('/{id}', [TrainingEventController::class, 'show']);        // Детали
+    Route::put('/{id}', [TrainingEventController::class, 'update']);      // Обновление
+    Route::delete('/{id}', [TrainingEventController::class, 'destroy']);  // Удаление
+    
+    // Участники
+    Route::post('/{id}/participants', [TrainingEventController::class, 'addParticipants']);
+    Route::delete('/{id}/participants', [TrainingEventController::class, 'removeAllParticipants']); 
+    // Удалить всех
+    Route::delete('/{id}/participants/{participantId}', [TrainingEventController::class, 'removeParticipant']); // Удалить одного
+    Route::post('/{id}/participants/remove-bulk', [TrainingEventController::class, 'removeParticipantsBulk']); // Массовое удаление
+    Route::put('/{id}/participants/{participantId}/status', [TrainingEventController::class, 'updateParticipantStatus']);
+
 });
 
 Route::get('/user', function (Request $request) {

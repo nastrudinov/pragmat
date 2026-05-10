@@ -2088,6 +2088,7 @@ class TrainingController extends Controller
         }
     }
     
+    
     /**
      * Получить историю обучения
      */
@@ -2138,4 +2139,215 @@ class TrainingController extends Controller
         if ($daysLeft <= 30) return 'warning';
         return 'active';
     }
+
+    /**
+     * GET /trainings/employee-courses-summary - Курсы всех сотрудников по срокам
+     */
+    public function getEmployeeCoursesSummary(Request $request)
+    {
+        try {
+            $today = now();
+            $monthEnd = $today->copy()->addDays(30);
+            $twoMonthsEnd = $today->copy()->addDays(60);
+            
+            // Получаем все записи обучений
+            $query = EmployeeCourse::with(['employee', 'course']);
+            
+            // Фильтр по подразделению
+            if ($request->has('department_id')) {
+                $query->whereHas('employee', function($q) use ($request) {
+                    $q->where('department_id', $request->department_id);
+                });
+            }
+            
+            // Фильтр по должности
+            if ($request->has('position_id')) {
+                $query->whereHas('employee', function($q) use ($request) {
+                    $q->where('position_id', $request->position_id);
+                });
+            }
+            
+            // Фильтр по бригаде
+            if ($request->has('brigade_id')) {
+                $query->whereHas('employee', function($q) use ($request) {
+                    $q->where('brigade_id', $request->brigade_id);
+                });
+            }
+            
+            // Фильтр по сотруднику
+            if ($request->has('employee_id')) {
+                $query->where('employee_id', $request->employee_id);
+            }
+            
+            $allTrainings = $query->get();
+            
+            // Разделяем по категориям
+            $expired = [];           // просрочены
+            $expiringMonth = [];      // просрочка в течение месяца
+            $expiringTwoMonths = [];  // просрочка от 1 до 2 месяцев
+            $active = [];             // активные (> 2 месяцев)
+            
+            foreach ($allTrainings as $training) {
+                $employee = $training->employee;
+                $course = $training->course;
+                $expirationDate = $training->expiration_date;
+                
+                if (!$expirationDate) {
+                    $active[] = $training;
+                    continue;
+                }
+                
+                $daysLeft = $today->diffInDays($expirationDate, false);
+                
+                $item = [
+                    'employee_id' => $employee->id,
+                    'employee_name' => $this->getEmployeeFullName($employee),
+                    'personnel_number' => $employee->personnel_number,
+                    'position' => $employee->position?->name ?? 'Не указана',
+                    'department' => $employee->department?->name ?? 'Не указано',
+                    'course_id' => $course->id,
+                    'course_name' => $course->name ?? 'Неизвестный курс',
+                    'course_category' => $course->category?->name,
+                    'training_id' => $training->id,
+                    'assigned_date' => $training->assigned_date?->format('Y-m-d'),
+                    'completed_date' => $training->completed_date?->format('Y-m-d'),
+                    'expiration_date' => $expirationDate->format('Y-m-d'),
+                    'days_left' => max(0, $daysLeft),
+                    'status' => $training->status,
+                    'certificate_number' => $training->certificate_number
+                ];
+                
+                if ($daysLeft < 0) {
+                    // Просрочены
+                    $item['days_overdue'] = abs($daysLeft);
+                    $expired[] = $item;
+                } elseif ($daysLeft <= 30) {
+                    // Истекают в течение месяца
+                    $expiringMonth[] = $item;
+                } elseif ($daysLeft <= 60) {
+                    // Истекают от 1 до 2 месяцев
+                    $expiringTwoMonths[] = $item;
+                } else {
+                    $active[] = $item;
+                }
+            }
+            
+            // Группировка по курсам для просроченных
+            $expiredByCourse = collect($expired)->groupBy('course_id')->map(function($items, $courseId) {
+                $first = $items->first();
+                return [
+                    'course_id' => $courseId,
+                    'course_name' => $first['course_name'],
+                    'course_category' => $first['course_category'],
+                    'count' => $items->count(),
+                    'employees' => $items->map(fn($i) => [
+                        'employee_id' => $i['employee_id'],
+                        'employee_name' => $i['employee_name'],
+                        'personnel_number' => $i['personnel_number'],
+                        'position' => $i['position'],
+                        'department' => $i['department'],
+                        'days_overdue' => $i['days_overdue'],
+                        'expiration_date' => $i['expiration_date']
+                    ])->values()
+                ];
+            })->values();
+            
+            // Группировка по курсам для истекающих в месяц
+            $expiringMonthByCourse = collect($expiringMonth)->groupBy('course_id')->map(function($items, $courseId) {
+                $first = $items->first();
+                return [
+                    'course_id' => $courseId,
+                    'course_name' => $first['course_name'],
+                    'course_category' => $first['course_category'],
+                    'count' => $items->count(),
+                    'employees' => $items->map(fn($i) => [
+                        'employee_id' => $i['employee_id'],
+                        'employee_name' => $i['employee_name'],
+                        'personnel_number' => $i['personnel_number'],
+                        'position' => $i['position'],
+                        'department' => $i['department'],
+                        'days_left' => $i['days_left'],
+                        'expiration_date' => $i['expiration_date']
+                    ])->values()
+                ];
+            })->values();
+            
+            // Группировка по курсам для истекающих от 1 до 2 месяцев
+            $expiringTwoMonthsByCourse = collect($expiringTwoMonths)->groupBy('course_id')->map(function($items, $courseId) {
+                $first = $items->first();
+                return [
+                    'course_id' => $courseId,
+                    'course_name' => $first['course_name'],
+                    'course_category' => $first['course_category'],
+                    'count' => $items->count(),
+                    'employees' => $items->map(fn($i) => [
+                        'employee_id' => $i['employee_id'],
+                        'employee_name' => $i['employee_name'],
+                        'personnel_number' => $i['personnel_number'],
+                        'position' => $i['position'],
+                        'department' => $i['department'],
+                        'days_left' => $i['days_left'],
+                        'expiration_date' => $i['expiration_date']
+                    ])->values()
+                ];
+            })->values();
+            
+            // Общая статистика
+            $statistics = [
+                'total_trainings' => $allTrainings->count(),
+                'expired_total' => count($expired),
+                'expiring_month_total' => count($expiringMonth),
+                'expiring_two_months_total' => count($expiringTwoMonths),
+                'active_total' => count($active),
+                'unique_employees_with_expired' => collect($expired)->unique('employee_id')->count(),
+                'unique_employees_expiring_month' => collect($expiringMonth)->unique('employee_id')->count(),
+                'unique_employees_expiring_two_months' => collect($expiringTwoMonths)->unique('employee_id')->count()
+            ];
+            
+            return response()->json([
+                'expired' => [
+                    'total' => count($expired),
+                    'by_course' => $expiredByCourse,
+                    'employees_list' => $expired
+                ],
+                'expiring_in_month' => [
+                    'total' => count($expiringMonth),
+                    'by_course' => $expiringMonthByCourse,
+                    'employees_list' => $expiringMonth
+                ],
+                'expiring_in_two_months' => [
+                    'total' => count($expiringTwoMonths),
+                    'by_course' => $expiringTwoMonthsByCourse,
+                    'employees_list' => $expiringTwoMonths
+                ],
+                'statistics' => $statistics
+            ], 200);
+            
+        } catch (\Exception $e) {
+            \Log::error('Employee courses summary error: ' . $e->getMessage());
+            return response()->json([
+                'error' => 'Failed to fetch employee courses summary',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Получить полное имя сотрудника
+     */
+    private function getEmployeeFullName($employee)
+    {
+        $fullName = trim(implode(' ', array_filter([
+            $employee->last_name,
+            $employee->first_name,
+            $employee->middle_name
+        ])));
+        
+        if (empty($fullName)) {
+            $fullName = $employee->full_name;
+        }
+        
+        return $fullName;
+    }
+    
 }

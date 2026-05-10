@@ -16,21 +16,13 @@ use Illuminate\Support\Facades\DB;
 class EmployeeController extends Controller
 {
     /**
-     * 4.1 GET /employees - Список сотрудников
+     * 4.1 GET /employees - Список всех сотрудников (без пагинации)
      */
-   public function index(Request $request)
+    public function index(Request $request)
     {
         try {
-            $page = $request->get('page', 1);
-            $limit = $request->get('limit', 50);
-            
             $query = Employee::with(['position', 'brigade', 'department'])
                 ->select('employees.*');
-            
-            // Фильтр по табельному номеру
-            if ($request->has('personnel_number')) {
-                $query->where('personnel_number', 'LIKE', "%{$request->personnel_number}%");
-            }
             
             // Фильтр по статусу
             if ($request->has('status')) {
@@ -56,7 +48,7 @@ class EmployeeController extends Controller
             if ($request->has('search')) {
                 $search = $request->search;
                 $query->where(function($q) use ($search) {
-                    $q->where('personnel_number', 'LIKE', "%{$search}%")  // Добавлено
+                    $q->where('personnel_number', 'LIKE', "%{$search}%")
                     ->orWhere('full_name', 'LIKE', "%{$search}%")
                     ->orWhere('last_name', 'LIKE', "%{$search}%")
                     ->orWhere('first_name', 'LIKE', "%{$search}%")
@@ -64,10 +56,20 @@ class EmployeeController extends Controller
                 });
             }
             
-            $total = $query->count();
-            $employees = $query->skip(($page - 1) * $limit)
-                            ->take($limit)
-                            ->get();
+            // Сортировка по personnel_number (по умолчанию)
+            $sortField = $request->get('sort_by', 'personnel_number');
+            $sortDirection = $request->get('sort_direction', 'asc');
+            
+            // Разрешенные поля для сортировки
+            $allowedSortFields = ['personnel_number', 'full_name', 'last_name', 'created_at', 'status'];
+            if (!in_array($sortField, $allowedSortFields)) {
+                $sortField = 'personnel_number';
+            }
+            
+            $query->orderBy($sortField, $sortDirection);
+            
+            // Получаем всех сотрудников (без пагинации)
+            $employees = $query->get();
             
             $formattedEmployees = $employees->map(function($employee) {
                 // Формируем ФИО из трех полей
@@ -84,7 +86,7 @@ class EmployeeController extends Controller
                 
                 return [
                     'id' => $employee->id,
-                    'personnel_number' => $employee->personnel_number,  // Добавлено
+                    'personnel_number' => $employee->personnel_number,
                     'full_name' => $fullName,
                     'last_name' => $employee->last_name,
                     'first_name' => $employee->first_name,
@@ -97,15 +99,14 @@ class EmployeeController extends Controller
                     'brigade_id' => $employee->brigade_id,
                     'status' => $employee->status,
                     'email' => $employee->email,
-                    'phone' => $employee->phone
+                    'phone' => $employee->phone,
+                    'created_at' => $employee->created_at?->toISOString()
                 ];
             });
             
             return response()->json([
                 'employees' => $formattedEmployees,
-                'total' => $total,
-                'page' => $page,
-                'limit' => $limit
+                'total' => $employees->count()
             ], 200);
             
         } catch (\Exception $e) {
@@ -656,6 +657,198 @@ class EmployeeController extends Controller
                 'success' => false,
                 'message' => 'Ошибка при удалении сотрудника',
                 'error' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * GET /employees/{id}/courses - Получить курсы сотрудника с разбивкой по срокам
+     */
+    public function getEmployeeCourses($id, Request $request)
+    {
+        try {
+            $employee = Employee::findOrFail($id);
+            
+            // Формируем ФИО
+            $fullName = trim(implode(' ', array_filter([
+                $employee->last_name,
+                $employee->first_name,
+                $employee->middle_name
+            ])));
+            
+            if (empty($fullName)) {
+                $fullName = $employee->full_name;
+            }
+            
+            // Получаем все обучения сотрудника с курсами
+            $employeeCourses = EmployeeCourse::with(['course.category'])
+                ->where('employee_id', $id)
+                ->get();
+            
+            $today = now();
+            $monthEnd = $today->copy()->addDays(30);
+            $twoMonthsEnd = $today->copy()->addDays(60);
+            
+            // 1. Просроченные курсы
+            $expiredCourses = $employeeCourses
+                ->filter(function($ec) use ($today) {
+                    return $ec->status === 'expired' || 
+                        ($ec->expiration_date && $ec->expiration_date < $today);
+                })
+                ->map(function($ec) {
+                    $daysOverdue = $ec->expiration_date 
+                        ? abs(now()->diffInDays($ec->expiration_date, false))
+                        : null;
+                        
+                    return [
+                        'id' => $ec->id,
+                        'course_id' => $ec->course_id,
+                        'course_name' => $ec->course?->name ?? 'Неизвестный курс',
+                        'category' => $ec->course?->category?->name,
+                        'assigned_date' => $ec->assigned_date?->format('Y-m-d'),
+                        'expiration_date' => $ec->expiration_date?->format('Y-m-d'),
+                        'status' => 'expired',
+                        'days_overdue' => $daysOverdue,
+                        'certificate_number' => $ec->certificate_number
+                    ];
+                })
+                ->values();
+            
+            // 2. Будут просрочены в течение месяца (до 30 дней)
+            $expiringMonthCourses = $employeeCourses
+                ->filter(function($ec) use ($today, $monthEnd) {
+                    return $ec->status === 'active' && 
+                        $ec->expiration_date && 
+                        $ec->expiration_date >= $today && 
+                        $ec->expiration_date <= $monthEnd;
+                })
+                ->map(function($ec) {
+                    $daysLeft = $ec->expiration_date 
+                        ? now()->diffInDays($ec->expiration_date, false)
+                        : null;
+                        
+                    return [
+                        'id' => $ec->id,
+                        'course_id' => $ec->course_id,
+                        'course_name' => $ec->course?->name ?? 'Неизвестный курс',
+                        'category' => $ec->course?->category?->name,
+                        'assigned_date' => $ec->assigned_date?->format('Y-m-d'),
+                        'expiration_date' => $ec->expiration_date?->format('Y-m-d'),
+                        'status' => 'expiring_soon',
+                        'days_left' => max(0, $daysLeft),
+                        'certificate_number' => $ec->certificate_number
+                    ];
+                })
+                ->values();
+            
+            // 3. Будут просрочены в течение от 1 до 2 месяцев (31-60 дней)
+            $expiringTwoMonthsCourses = $employeeCourses
+                ->filter(function($ec) use ($monthEnd, $twoMonthsEnd) {
+                    return $ec->status === 'active' && 
+                        $ec->expiration_date && 
+                        $ec->expiration_date > $monthEnd && 
+                        $ec->expiration_date <= $twoMonthsEnd;
+                })
+                ->map(function($ec) {
+                    $daysLeft = $ec->expiration_date 
+                        ? now()->diffInDays($ec->expiration_date, false)
+                        : null;
+                        
+                    return [
+                        'id' => $ec->id,
+                        'course_id' => $ec->course_id,
+                        'course_name' => $ec->course?->name ?? 'Неизвестный курс',
+                        'category' => $ec->course?->category?->name,
+                        'assigned_date' => $ec->assigned_date?->format('Y-m-d'),
+                        'expiration_date' => $ec->expiration_date?->format('Y-m-d'),
+                        'status' => 'expiring_later',
+                        'days_left' => max(0, $daysLeft),
+                        'certificate_number' => $ec->certificate_number
+                    ];
+                })
+                ->values();
+            
+            // 4. Активные курсы (со сроком более 2 месяцев)
+            $activeCourses = $employeeCourses
+                ->filter(function($ec) use ($twoMonthsEnd) {
+                    return $ec->status === 'active' && 
+                        ($ec->expiration_date === null || $ec->expiration_date > $twoMonthsEnd);
+                })
+                ->map(function($ec) {
+                    return [
+                        'id' => $ec->id,
+                        'course_id' => $ec->course_id,
+                        'course_name' => $ec->course?->name ?? 'Неизвестный курс',
+                        'category' => $ec->course?->category?->name,
+                        'assigned_date' => $ec->assigned_date?->format('Y-m-d'),
+                        'expiration_date' => $ec->expiration_date?->format('Y-m-d'),
+                        'status' => 'active',
+                        'certificate_number' => $ec->certificate_number
+                    ];
+                })
+                ->values();
+            
+            // 5. Требуемые курсы (без назначения)
+            $allCourses = Course::all();
+            $assignedCourseIds = $employeeCourses->pluck('course_id')->toArray();
+            
+            $requiredCourses = $allCourses
+                ->filter(function($course) use ($assignedCourseIds) {
+                    return !in_array($course->id, $assignedCourseIds);
+                })
+                ->map(function($course) {
+                    return [
+                        'course_id' => $course->id,
+                        'course_name' => $course->name,
+                        'category' => $course->category?->name,
+                        'status' => 'required',
+                        'assigned_date' => null,
+                        'expiration_date' => null
+                    ];
+                })
+                ->values();
+            
+            // Статистика
+            $statistics = [
+                'total_courses' => $employeeCourses->count() + $requiredCourses->count(),
+                'assigned_count' => $employeeCourses->count(),
+                'required_count' => $requiredCourses->count(),
+                'expired_count' => $expiredCourses->count(),
+                'expiring_month_count' => $expiringMonthCourses->count(),
+                'expiring_two_months_count' => $expiringTwoMonthsCourses->count(),
+                'active_count' => $activeCourses->count(),
+                'compliance_rate' => $employeeCourses->count() > 0 
+                    ? round(($activeCourses->count() / $employeeCourses->count()) * 100)
+                    : 0
+            ];
+            
+            return response()->json([
+                'employee' => [
+                    'id' => $employee->id,
+                    'full_name' => $fullName,
+                    'personnel_number' => $employee->personnel_number,
+                    'position' => $employee->position?->name,
+                    'department' => $employee->department?->name
+                ],
+                'courses' => [
+                    'expired' => $expiredCourses,
+                    'expiring_in_month' => $expiringMonthCourses,
+                    'expiring_in_two_months' => $expiringTwoMonthsCourses,
+                    'active' => $activeCourses,
+                    'required' => $requiredCourses
+                ],
+                'statistics' => $statistics
+            ], 200);
+            
+        } catch (ModelNotFoundException $e) {
+            return response()->json([
+                'error' => 'Employee not found'
+            ], 404);
+        } catch (\Exception $e) {
+            \Log::error('Get employee courses error: ' . $e->getMessage());
+            return response()->json([
+                'error' => 'Failed to fetch employee courses',
+                'message' => $e->getMessage()
             ], 500);
         }
     }

@@ -15,6 +15,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Support\Facades\DB;
+use App\Models\TrainingEvent;
 
 class CourseController extends Controller
 {
@@ -821,5 +822,220 @@ class CourseController extends Controller
         } else {
             return 'мес.';
         }
+    }
+
+    /**
+     * GET /courses/{courseId}/employees - Получить сотрудников, привязанных к курсу
+     */
+    public function getCourseEmployees($courseId)
+    {
+        try {
+            $course = Course::with(['category'])->findOrFail($courseId);
+            
+            // Получаем всех сотрудников с этим курсом
+            $employeeCourses = EmployeeCourse::with(['employee' => function($query) {
+                    $query->with(['position', 'department', 'brigade']);
+                }])
+                ->where('course_id', $courseId)
+                ->get();
+            
+            $employees = $employeeCourses->map(function($employeeCourse) {
+                $employee = $employeeCourse->employee;
+                
+                // Формируем ФИО
+                $fullName = trim(implode(' ', array_filter([
+                    $employee->last_name,
+                    $employee->first_name,
+                    $employee->middle_name
+                ])));
+                
+                if (empty($fullName)) {
+                    $fullName = $employee->full_name;
+                }
+                
+                return [
+                    'id' => $employee->id,
+                    'personnel_number' => $employee->personnel_number,
+                    'full_name' => $fullName,
+                    'last_name' => $employee->last_name,
+                    'first_name' => $employee->first_name,
+                    'middle_name' => $employee->middle_name,
+                    'position' => $employee->position?->name ?? 'Не указана',
+                    'position_id' => $employee->position_id,
+                    'department' => $employee->department?->name ?? 'Не указано',
+                    'department_id' => $employee->department_id,
+                   /* 'brigade' => $employee->brigade?->name ?? 'Не указана',
+                    'brigade_id' => $employee->brigade_id,
+                    'status' => $employee->status,
+                    'email' => $employee->email,
+                    'phone' => $employee->phone,
+                    'training' => [
+                        'id' => $employeeCourse->id,
+                        'assigned_date' => $employeeCourse->assigned_date?->format('Y-m-d'),
+                        'completed_date' => $employeeCourse->completed_date?->format('Y-m-d'),
+                        'expiration_date' => $employeeCourse->expiration_date?->format('Y-m-d'),
+                        'status' => $employeeCourse->status,
+                        'certificate_number' => $employeeCourse->certificate_number,
+                        'regulatory_acts' => $employeeCourse->regulatory_acts
+                    ]*/
+                ];
+            });
+            
+            // Статистика по курсу
+            $statistics = [
+                'total_employees' => $employees->count(),
+                'by_status' => [
+                    'active' => $employees->where('training.status', 'active')->count(),
+                    'expired' => $employees->where('training.status', 'expired')->count(),
+                    'expiring' => $employees->where('training.status', 'expiring')->count(),
+                    'required' => $employees->where('training.status', 'required')->count(),
+                    'no_data' => $employees->where('training.status', 'noData')->count()
+                ],
+                'by_department' => $employees->groupBy('department_id')->map(function($group, $deptId) {
+                    $dept = $group->first()['department'] ?? 'Без подразделения';
+                    return [
+                        'department_name' => $dept,
+                        'count' => $group->count()
+                    ];
+                })->values(),
+                'compliance_rate' => $employees->count() > 0 
+                    ? round(($employees->where('training.status', 'active')->count() / $employees->count()) * 100)
+                    : 0
+            ];
+            
+            return response()->json([
+                'course' => [
+                    'id' => $course->id,
+                    'name' => $course->name,
+                    'category' => $course->category?->name,
+                    'duration_hours' => $course->duration_hours,
+                    'periodicity_months' => $course->periodicity_months
+                ],
+                'employees' => $employees,
+                'statistics' => $statistics,
+                'total' => $employees->count()
+            ], 200);
+            
+        } catch (ModelNotFoundException $e) {
+            return response()->json([
+                'error' => 'Course not found'
+            ], 404);
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => 'Failed to fetch course employees',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * GET /courses/{courseId}/events - Получить все мероприятия для курса
+     */
+    public function getCourseEvents($courseId)
+    {
+        try {
+            $course = Course::with(['category'])->findOrFail($courseId);
+            
+            $events = TrainingEvent::with(['course', 'participants'])
+                ->where('course_id', $courseId)
+                ->orderBy('start_date', 'desc')
+                ->get();
+            
+            $formattedEvents = $events->map(function($event) {
+                return [
+                    'id' => $event->id,
+                    'title' => $event->title,
+                    'format' => $event->format,
+                    'format_label' => $this->getFormatLabel($event->format),
+                    'start_date' => $event->start_date->format('Y-m-d'),
+                    'end_date' => $event->end_date?->format('Y-m-d'),
+                    'location' => $event->location,
+                    'training_center' => $event->training_center,
+                    'status' => $event->status,
+                    'status_label' => $this->getStatusLabel($event->status),
+                    'status_color' => $this->getStatusColor($event->status),
+                    'cost' => $event->cost,
+                    'participants_count' => $event->participants->count(),
+                    'max_participants' => $event->max_participants,
+                    'available_slots' => $event->max_participants 
+                        ? max(0, $event->max_participants - $event->participants->count())
+                        : null
+                ];
+            });
+            
+            // Статистика по мероприятиям курса
+            $statistics = [
+                'total_events' => $events->count(),
+                'by_status' => [
+                    'draft' => $events->where('status', 'draft')->count(),
+                    'confirmed' => $events->where('status', 'confirmed')->count(),
+                    'in_progress' => $events->where('status', 'in_progress')->count(),
+                    'completed' => $events->where('status', 'completed')->count(),
+                    'cancelled' => $events->where('status', 'cancelled')->count()
+                ],
+                'by_format' => [
+                    'onsite' => $events->where('format', 'onsite')->count(),
+                    'online' => $events->where('format', 'online')->count(),
+                    'hybrid' => $events->where('format', 'hybrid')->count()
+                ],
+                'total_participants' => $events->sum(fn($e) => $e->participants->count()),
+                'upcoming_events' => $events->where('start_date', '>=', now())->count(),
+                'past_events' => $events->where('start_date', '<', now())->count()
+            ];
+            
+            return response()->json([
+                'course' => [
+                    'id' => $course->id,
+                    'name' => $course->name,
+                    'category' => $course->category?->name
+                ],
+                'events' => $formattedEvents,
+                'statistics' => $statistics,
+                'total' => $events->count()
+            ], 200);
+            
+        } catch (ModelNotFoundException $e) {
+            return response()->json([
+                'error' => 'Course not found'
+            ], 404);
+        } catch (\Exception $e) {
+            \Log::error('Get course events error: ' . $e->getMessage());
+            return response()->json([
+                'error' => 'Failed to fetch course events',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    // Вспомогательные методы (если их нет)
+    private function getFormatLabel($format)
+    {
+        return [
+            'onsite' => 'Очное',
+            'online' => 'Онлайн',
+            'hybrid' => 'Гибридное'
+        ][$format] ?? $format;
+    }
+
+    private function getStatusLabel($status)
+    {
+        return [
+            'draft' => 'Черновик',
+            'confirmed' => 'Подтверждено',
+            'in_progress' => 'В процессе',
+            'completed' => 'Завершено',
+            'cancelled' => 'Отменено'
+        ][$status] ?? $status;
+    }
+
+    private function getStatusColor($status)
+    {
+        return [
+            'draft' => '#9ca3af',
+            'confirmed' => '#10b981',
+            'in_progress' => '#3b82f6',
+            'completed' => '#8b5cf6',
+            'cancelled' => '#ef4444'
+        ][$status] ?? '#9ca3af';
     }
 }
