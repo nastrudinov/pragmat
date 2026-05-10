@@ -12,6 +12,7 @@ use Illuminate\Support\Facades\Validator;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
+use App\Models\TrainingEvent;
 
 class TrainingController extends Controller
 {
@@ -2140,7 +2141,7 @@ class TrainingController extends Controller
         return 'active';
     }
 
-    /**
+   /**
      * GET /trainings/employee-courses-summary - Курсы всех сотрудников по срокам
      */
     public function getEmployeeCoursesSummary(Request $request)
@@ -2181,11 +2182,28 @@ class TrainingController extends Controller
             
             $allTrainings = $query->get();
             
+            // Получаем все мероприятия и участников
+            $allEvents = TrainingEvent::with(['participants'])->get();
+            
+            // Создаем маппинг: course_id -> [employee_id => event_id]
+            $eventMapping = [];
+            foreach ($allEvents as $event) {
+                foreach ($event->participants as $participant) {
+                    $eventMapping[$event->course_id][$participant->employee_id] = [
+                        'event_id' => $event->id,
+                        'event_title' => $event->title,
+                        'event_start_date' => $event->start_date->format('Y-m-d'),
+                        'event_status' => $event->status,
+                        'participant_status' => $participant->status
+                    ];
+                }
+            }
+            
             // Разделяем по категориям
-            $expired = [];           // просрочены
-            $expiringMonth = [];      // просрочка в течение месяца
-            $expiringTwoMonths = [];  // просрочка от 1 до 2 месяцев
-            $active = [];             // активные (> 2 месяцев)
+            $expired = [];
+            $expiringMonth = [];
+            $expiringTwoMonths = [];
+            $active = [];
             
             foreach ($allTrainings as $training) {
                 $employee = $training->employee;
@@ -2199,12 +2217,17 @@ class TrainingController extends Controller
                 
                 $daysLeft = $today->diffInDays($expirationDate, false);
                 
+                // Проверяем, записан ли сотрудник на мероприятие по этому курсу
+                $eventInfo = $eventMapping[$course->id][$employee->id] ?? null;
+                
                 $item = [
                     'employee_id' => $employee->id,
                     'employee_name' => $this->getEmployeeFullName($employee),
                     'personnel_number' => $employee->personnel_number,
                     'position' => $employee->position?->name ?? 'Не указана',
+                    'position_id' => $employee->position_id,  // Добавлено
                     'department' => $employee->department?->name ?? 'Не указано',
+                    'department_id' => $employee->department_id,  // Добавлено
                     'course_id' => $course->id,
                     'course_name' => $course->name ?? 'Неизвестный курс',
                     'course_category' => $course->category?->name,
@@ -2214,25 +2237,24 @@ class TrainingController extends Controller
                     'expiration_date' => $expirationDate->format('Y-m-d'),
                     'days_left' => max(0, $daysLeft),
                     'status' => $training->status,
-                    'certificate_number' => $training->certificate_number
+                    'certificate_number' => $training->certificate_number,
+                    'registered_for_event' => $eventInfo !== null,
+                    'event' => $eventInfo
                 ];
                 
                 if ($daysLeft < 0) {
-                    // Просрочены
                     $item['days_overdue'] = abs($daysLeft);
                     $expired[] = $item;
                 } elseif ($daysLeft <= 30) {
-                    // Истекают в течение месяца
                     $expiringMonth[] = $item;
                 } elseif ($daysLeft <= 60) {
-                    // Истекают от 1 до 2 месяцев
                     $expiringTwoMonths[] = $item;
                 } else {
                     $active[] = $item;
                 }
             }
             
-            // Группировка по курсам для просроченных
+            // Группировка по курсам для просроченных с информацией о мероприятиях
             $expiredByCourse = collect($expired)->groupBy('course_id')->map(function($items, $courseId) {
                 $first = $items->first();
                 return [
@@ -2240,14 +2262,25 @@ class TrainingController extends Controller
                     'course_name' => $first['course_name'],
                     'course_category' => $first['course_category'],
                     'count' => $items->count(),
+                    'registered_count' => $items->where('registered_for_event', true)->count(),
+                    'not_registered_count' => $items->where('registered_for_event', false)->count(),
                     'employees' => $items->map(fn($i) => [
                         'employee_id' => $i['employee_id'],
                         'employee_name' => $i['employee_name'],
                         'personnel_number' => $i['personnel_number'],
                         'position' => $i['position'],
+                        'position_id' => $i['position_id'],  // Добавлено
                         'department' => $i['department'],
+                        'department_id' => $i['department_id'],  // Добавлено
                         'days_overdue' => $i['days_overdue'],
-                        'expiration_date' => $i['expiration_date']
+                        'expiration_date' => $i['expiration_date'],
+                        'registered_for_event' => $i['registered_for_event'],
+                        'event' => $i['event'] ? [
+                            'event_id' => $i['event']['event_id'],
+                            'event_title' => $i['event']['event_title'],
+                            'event_start_date' => $i['event']['event_start_date'],
+                            'participant_status' => $i['event']['participant_status']
+                        ] : null
                     ])->values()
                 ];
             })->values();
@@ -2260,6 +2293,8 @@ class TrainingController extends Controller
                     'course_name' => $first['course_name'],
                     'course_category' => $first['course_category'],
                     'count' => $items->count(),
+                    'registered_count' => $items->where('registered_for_event', true)->count(),
+                    'not_registered_count' => $items->where('registered_for_event', false)->count(),
                     'employees' => $items->map(fn($i) => [
                         'employee_id' => $i['employee_id'],
                         'employee_name' => $i['employee_name'],
@@ -2267,7 +2302,14 @@ class TrainingController extends Controller
                         'position' => $i['position'],
                         'department' => $i['department'],
                         'days_left' => $i['days_left'],
-                        'expiration_date' => $i['expiration_date']
+                        'expiration_date' => $i['expiration_date'],
+                        'registered_for_event' => $i['registered_for_event'],
+                        'event' => $i['event'] ? [
+                            'event_id' => $i['event']['event_id'],
+                            'event_title' => $i['event']['event_title'],
+                            'event_start_date' => $i['event']['event_start_date'],
+                            'participant_status' => $i['event']['participant_status']
+                        ] : null
                     ])->values()
                 ];
             })->values();
@@ -2280,6 +2322,8 @@ class TrainingController extends Controller
                     'course_name' => $first['course_name'],
                     'course_category' => $first['course_category'],
                     'count' => $items->count(),
+                    'registered_count' => $items->where('registered_for_event', true)->count(),
+                    'not_registered_count' => $items->where('registered_for_event', false)->count(),
                     'employees' => $items->map(fn($i) => [
                         'employee_id' => $i['employee_id'],
                         'employee_name' => $i['employee_name'],
@@ -2287,7 +2331,14 @@ class TrainingController extends Controller
                         'position' => $i['position'],
                         'department' => $i['department'],
                         'days_left' => $i['days_left'],
-                        'expiration_date' => $i['expiration_date']
+                        'expiration_date' => $i['expiration_date'],
+                        'registered_for_event' => $i['registered_for_event'],
+                        'event' => $i['event'] ? [
+                            'event_id' => $i['event']['event_id'],
+                            'event_title' => $i['event']['event_title'],
+                            'event_start_date' => $i['event']['event_start_date'],
+                            'participant_status' => $i['event']['participant_status']
+                        ] : null
                     ])->values()
                 ];
             })->values();
@@ -2301,24 +2352,29 @@ class TrainingController extends Controller
                 'active_total' => count($active),
                 'unique_employees_with_expired' => collect($expired)->unique('employee_id')->count(),
                 'unique_employees_expiring_month' => collect($expiringMonth)->unique('employee_id')->count(),
-                'unique_employees_expiring_two_months' => collect($expiringTwoMonths)->unique('employee_id')->count()
+                'unique_employees_expiring_two_months' => collect($expiringTwoMonths)->unique('employee_id')->count(),
+                'registered_for_events' => [
+                    'expired' => collect($expired)->where('registered_for_event', true)->count(),
+                    'expiring_month' => collect($expiringMonth)->where('registered_for_event', true)->count(),
+                    'expiring_two_months' => collect($expiringTwoMonths)->where('registered_for_event', true)->count()
+                ]
             ];
             
             return response()->json([
                 'expired' => [
                     'total' => count($expired),
                     'by_course' => $expiredByCourse,
-                    'employees_list' => $expired
+                    //'employees_list' => $expired
                 ],
                 'expiring_in_month' => [
                     'total' => count($expiringMonth),
                     'by_course' => $expiringMonthByCourse,
-                    'employees_list' => $expiringMonth
+                  //  'employees_list' => $expiringMonth
                 ],
                 'expiring_in_two_months' => [
                     'total' => count($expiringTwoMonths),
                     'by_course' => $expiringTwoMonthsByCourse,
-                    'employees_list' => $expiringTwoMonths
+                  //  'employees_list' => $expiringTwoMonths
                 ],
                 'statistics' => $statistics
             ], 200);
