@@ -5,12 +5,23 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Foundation\Auth\User as Authenticatable;
+use Laravel\Sanctum\HasApiTokens;
 use Illuminate\Support\Facades\Hash;
 
-class UserAccount extends Model
+class UserAccount extends Authenticatable  // Изменено с Model на Authenticatable
 {
+    use HasApiTokens;  // Добавлено для Sanctum
+
+    protected $table = 'user_accounts';
+    
     protected $fillable = [
-        'employee_id', 'username', 'password_hash', 'role', 'status', 'last_login'
+        'employee_id',
+        'username',
+        'password_hash',
+        'role',
+        'status',
+        'last_login'
     ];
 
     protected $hidden = [
@@ -19,7 +30,15 @@ class UserAccount extends Model
 
     protected $casts = [
         'last_login' => 'datetime',
+        'created_at' => 'datetime',
+        'updated_at' => 'datetime',
     ];
+
+    // Sanctum использует поле password для аутентификации
+    public function getAuthPassword()
+    {
+        return $this->password_hash;
+    }
 
     public function employee(): BelongsTo
     {

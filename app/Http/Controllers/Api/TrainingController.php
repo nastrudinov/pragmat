@@ -7,15 +7,25 @@ use App\Models\EmployeeCourse;
 use App\Models\Employee;
 use App\Models\Course;
 use App\Models\Brigade;
+use App\Models\Position;
+use App\Models\PositionCourseRequirement;
+use App\Models\BrigadeCourseRequirement;
+use App\Models\TrainingEvent;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Storage;
-use App\Models\TrainingEvent;
+use Illuminate\Support\Facades\Cache;
+use Carbon\Carbon;
 
 class TrainingController extends Controller
 {
+    /**
+     * Время жизни кэша (минуты)
+     */
+    private $cacheTTL = 15;
+    private $longCacheTTL = 60;
+    
     /**
      * 2.1 GET /trainings/expired - Просроченные обучения
      */
@@ -25,64 +35,43 @@ class TrainingController extends Controller
             $page = $request->get('page', 1);
             $limit = $request->get('limit', 20);
             
-            $query = EmployeeCourse::with(['employee.position', 'employee.brigade', 'course'])
-                ->where('status', 'expired')
-                ->whereNotNull('expiration_date')
-                ->where('expiration_date', '<', now())
-                ->orderBy('expiration_date', 'asc');
+            $cacheKey = $this->getCacheKey('expired', $request);
             
-            // Фильтр по бригаде
-            if ($request->has('brigade_id')) {
-                $query->whereHas('employee', function($q) use ($request) {
-                    $q->where('brigade_id', $request->brigade_id);
-                });
-            }
+            $result = Cache::remember($cacheKey, now()->addMinutes($this->cacheTTL), function() use ($request, $page, $limit) {
+                $query = EmployeeCourse::with(['employee:id,full_name,brigade_id,position_id', 'employee.position:id,name', 'employee.brigade:id,name', 'course:id,name'])
+                    ->select(['id', 'employee_id', 'course_id', 'status', 'expiration_date'])
+                    ->where('status', 'expired')
+                    ->whereNotNull('expiration_date')
+                    ->where('expiration_date', '<', now())
+                    ->orderBy('expiration_date', 'asc');
+                
+                if ($request->filled('brigade_id')) {
+                    $query->whereHas('employee', fn($q) => $q->where('brigade_id', $request->brigade_id));
+                }
+                
+                if ($request->filled('search')) {
+                    $search = $request->search;
+                    $query->whereHas('employee', fn($q) => $q->where('full_name', 'LIKE', "%{$search}%"));
+                }
+                
+                $total = $query->count();
+                $hasMore = ($page * $limit) < $total;
+                
+                $trainings = $query->skip(($page - 1) * $limit)->take($limit)->get();
+                
+                return [
+                    'trainings' => $trainings->map(fn($training) => $this->formatExpiredTraining($training)),
+                    'total' => $total,
+                    'page' => $page,
+                    'limit' => $limit,
+                    'hasMore' => $hasMore
+                ];
+            });
             
-            // Поиск по сотруднику
-            if ($request->has('search')) {
-                $search = $request->search;
-                $query->whereHas('employee', function($q) use ($search) {
-                    $q->where('full_name', 'LIKE', "%{$search}%");
-                });
-            }
-            
-            $total = $query->count();
-            $hasMore = ($page * $limit) < $total;
-            
-            $trainings = $query->skip(($page - 1) * $limit)
-                               ->take($limit)
-                               ->get()
-                               ->map(function($training) {
-                                   $daysOverdue = now()->diffInDays($training->expiration_date, false);
-                                   
-                                   return [
-                                       'id' => $training->id,
-                                       'employeeName' => $training->employee->full_name,
-                                       'employeePosition' => $training->employee->position?->name ?? 'Не указана',
-                                       'employeeId' => $training->employee_id,
-                                       'trainingName' => $training->course?->name ?? 'Неизвестный курс',
-                                       'trainingId' => $training->course_id,
-                                       'expiredDate' => $training->expiration_date?->format('Y-m-d'),
-                                       'daysOverdue' => abs($daysOverdue),
-                                       'brigade' => $training->employee->brigade?->name ?? 'Не указана',
-                                       'brigadeId' => $training->employee->brigade_id,
-                                       'status' => $training->status
-                                   ];
-                               });
-            
-            return response()->json([
-                'trainings' => $trainings,
-                'total' => $total,
-                'page' => $page,
-                'limit' => $limit,
-                'hasMore' => $hasMore
-            ], 200);
+            return response()->json($result, 200);
             
         } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to fetch expired trainings',
-                'message' => $e->getMessage()
-            ], 500);
+            return response()->json(['error' => 'Failed to fetch expired trainings', 'message' => $e->getMessage()], 500);
         }
     }
     
@@ -95,113 +84,89 @@ class TrainingController extends Controller
             $days = (int) $days;
             $page = $request->get('page', 1);
             $limit = $request->get('limit', 20);
-            
             $today = now();
             $expiryDate = now()->addDays($days);
             
-            $query = EmployeeCourse::with(['employee.position', 'employee.brigade', 'course'])
-                ->where('status', 'active')
-                ->whereNotNull('expiration_date')
-                ->whereBetween('expiration_date', [$today, $expiryDate])
-                ->orderBy('expiration_date', 'asc');
+            $cacheKey = $this->getCacheKey("expiring_{$days}", $request);
             
-            // Фильтр по бригаде
-            if ($request->has('brigade_id')) {
-                $query->whereHas('employee', function($q) use ($request) {
-                    $q->where('brigade_id', $request->brigade_id);
-                });
-            }
+            $result = Cache::remember($cacheKey, now()->addMinutes($this->cacheTTL), function() use ($request, $today, $expiryDate, $page, $limit) {
+                $query = EmployeeCourse::with(['employee:id,full_name,brigade_id,position_id', 'employee.position:id,name', 'employee.brigade:id,name', 'course:id,name'])
+                    ->select(['id', 'employee_id', 'course_id', 'status', 'expiration_date'])
+                    ->where('status', 'active')
+                    ->whereNotNull('expiration_date')
+                    ->whereBetween('expiration_date', [$today, $expiryDate])
+                    ->orderBy('expiration_date', 'asc');
+                
+                if ($request->filled('brigade_id')) {
+                    $query->whereHas('employee', fn($q) => $q->where('brigade_id', $request->brigade_id));
+                }
+                if ($request->filled('employee_id')) {
+                    $query->where('employee_id', $request->employee_id);
+                }
+                
+                $total = $query->count();
+                $hasMore = ($page * $limit) < $total;
+                $trainings = $query->skip(($page - 1) * $limit)->take($limit)->get();
+                
+                return [
+                    'trainings' => $trainings->map(fn($training) => $this->formatExpiringTraining($training, $today)),
+                    'total' => $total,
+                    'page' => $page,
+                    'limit' => $limit,
+                    'hasMore' => $hasMore
+                ];
+            });
             
-            // Фильтр по сотруднику
-            if ($request->has('employee_id')) {
-                $query->where('employee_id', $request->employee_id);
-            }
-            
-            $total = $query->count();
-            $hasMore = ($page * $limit) < $total;
-            
-            $trainings = $query->skip(($page - 1) * $limit)
-                               ->take($limit)
-                               ->get()
-                               ->map(function($training) use ($today) {
-                                   $daysLeft = $today->diffInDays($training->expiration_date, false);
-                                   
-                                   return [
-                                       'id' => $training->id,
-                                       'employeeName' => $training->employee->full_name,
-                                       'employeePosition' => $training->employee->position?->name ?? 'Не указана',
-                                       'employeeId' => $training->employee_id,
-                                       'trainingName' => $training->course?->name ?? 'Неизвестный курс',
-                                       'trainingId' => $training->course_id,
-                                       'expiresDate' => $training->expiration_date?->format('Y-m-d'),
-                                       'daysLeft' => max(0, $daysLeft),
-                                       'brigade' => $training->employee->brigade?->name ?? 'Не указана',
-                                       'brigadeId' => $training->employee->brigade_id,
-                                       'status' => $this->getExpiryStatus($daysLeft)
-                                   ];
-                               });
-            
-            return response()->json([
-                'trainings' => $trainings,
-                'total' => $total,
-                'page' => $page,
-                'limit' => $limit,
-                'hasMore' => $hasMore
-            ], 200);
+            return response()->json($result, 200);
             
         } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to fetch expiring trainings',
-                'message' => $e->getMessage()
-            ], 500);
+            return response()->json(['error' => 'Failed to fetch expiring trainings', 'message' => $e->getMessage()], 500);
         }
     }
     
     /**
      * 2.3 GET /trainings/{id} - Детали обучения
      */
-   public function show($id)
+    public function show($id)
     {
         try {
-            $training = EmployeeCourse::with(['employee.position', 'employee.brigade', 'course'])
-                ->findOrFail($id);
+            $cacheKey = "training_details_{$id}";
             
-            // История изменений
-            $history = $this->getTrainingHistory($training);
+            $result = Cache::remember($cacheKey, now()->addMinutes($this->cacheTTL), function() use ($id) {
+                $training = EmployeeCourse::with(['employee.position', 'employee.brigade', 'course'])
+                    ->findOrFail($id);
+                
+                $history = $this->getTrainingHistory($training);
+                
+                return [
+                    'id' => $training->id,
+                    'trainingName' => $training->course?->name ?? 'Неизвестный курс',
+                    'trainingId' => $training->course_id,
+                    'employee' => [
+                        'id' => $training->employee->id,
+                        'name' => $training->employee->full_name,
+                        'position' => $training->employee->position?->name ?? 'Не указана',
+                        'brigade' => $training->employee->brigade?->name ?? 'Не указана',
+                        'brigadeId' => $training->employee->brigade_id
+                    ],
+                    'assignedDate' => $training->assigned_date?->format('Y-m-d'),
+                    'completedDate' => $training->completed_date?->format('Y-m-d'),
+                    'expiresDate' => $training->expiration_date?->format('Y-m-d'),
+                    'status' => $training->status,
+                    'certificateUrl' => $training->certificate_file_path,
+                    'certificateNumber' => $training->certificate_number,
+                    'regulatoryActs' => $training->regulatory_acts,
+                    'history' => $history,
+                    'lastReminderSent' => $training->last_reminder_sent?->format('Y-m-d')
+                ];
+            });
             
-            $response = [
-                'id' => $training->id,
-                'trainingName' => $training->course?->name ?? 'Неизвестный курс',
-                'trainingId' => $training->course_id,
-                'employee' => [
-                    'id' => $training->employee->id,
-                    'name' => $training->employee->full_name,
-                    'position' => $training->employee->position?->name ?? 'Не указана',
-                    'brigade' => $training->employee->brigade?->name ?? 'Не указана',
-                    'brigadeId' => $training->employee->brigade_id
-                ],
-                'assignedDate' => $training->assigned_date?->format('Y-m-d'),
-                'completedDate' => $training->completed_date?->format('Y-m-d'),
-                'expiresDate' => $training->expiration_date?->format('Y-m-d'),
-                'status' => $training->status,
-                'certificateUrl' => $training->certificate_file_path,
-                'certificateNumber' => $training->certificate_number,      // Добавлено
-                'regulatoryActs' => $training->regulatory_acts,            // Добавлено
-                'history' => $history,
-                'lastReminderSent' => $training->last_reminder_sent?->format('Y-m-d')
-            ];
-            
-            return response()->json($response, 200);
+            return response()->json($result, 200);
             
         } catch (ModelNotFoundException $e) {
-            return response()->json([
-                'error' => 'Training not found'
-            ], 404);
+            return response()->json(['error' => 'Training not found'], 404);
         } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to fetch training details',
-                'message' => $e->getMessage()
-            ], 500);
+            return response()->json(['error' => 'Failed to fetch training details', 'message' => $e->getMessage()], 500);
         }
     }
     
@@ -211,57 +176,41 @@ class TrainingController extends Controller
     public function getEmployeeTrainings($employeeId)
     {
         try {
-            $employee = Employee::with(['position', 'brigade'])->findOrFail($employeeId);
+            $cacheKey = "employee_trainings_{$employeeId}";
             
-            $trainings = EmployeeCourse::with(['course'])
-                ->where('employee_id', $employeeId)
-                ->orderBy('expiration_date', 'asc')
-                ->get()
-                ->map(function($training) {
-                    return [
-                        'id' => $training->id,
-                        'name' => $training->course?->name ?? 'Неизвестный курс',
-                        'courseId' => $training->course_id,
-                        'status' => $training->status,
-                        'assignedDate' => $training->assigned_date?->format('Y-m-d'),
-                        'completedDate' => $training->completed_date?->format('Y-m-d'),
-                        'expiresDate' => $training->expiration_date?->format('Y-m-d'),
-                        'daysLeft' => $training->expiration_date 
-                            ? now()->diffInDays($training->expiration_date, false) 
-                            : null,
-                        'certificateUrl' => $training->certificate_file_path,
-                        'certificateNumber' => $training->certificate_number,    // Добавлено
-                        'regulatoryActs' => $training->regulatory_acts           // Добавлено
-                    ];
-                });
+            $result = Cache::remember($cacheKey, now()->addMinutes($this->cacheTTL), function() use ($employeeId) {
+                $employee = Employee::with(['position:id,name', 'brigade:id,name'])->findOrFail($employeeId);
+                
+                $trainings = EmployeeCourse::with(['course:id,name'])
+                    ->where('employee_id', $employeeId)
+                    ->orderBy('expiration_date', 'asc')
+                    ->get()
+                    ->map(fn($training) => $this->formatEmployeeTraining($training));
+                
+                $stats = [
+                    'total' => $trainings->count(),
+                    'active' => $trainings->where('status', 'active')->count(),
+                    'expired' => $trainings->where('status', 'expired')->count(),
+                    'expiring' => $trainings->where('status', 'expiring')->count(),
+                    'compliance' => $trainings->where('status', 'expired')->count() === 0
+                ];
+                
+                return [
+                    'employeeId' => $employee->id,
+                    'employeeName' => $employee->full_name,
+                    'employeePosition' => $employee->position?->name ?? 'Не указана',
+                    'brigade' => $employee->brigade?->name ?? 'Не указана',
+                    'trainings' => $trainings,
+                    'statistics' => $stats
+                ];
+            });
             
-            // Статистика по обучениям сотрудника
-            $stats = [
-                'total' => $trainings->count(),
-                'active' => $trainings->where('status', 'active')->count(),
-                'expired' => $trainings->where('status', 'expired')->count(),
-                'expiring' => $trainings->where('status', 'expiring')->count(),
-                'compliance' => $trainings->where('status', 'expired')->count() === 0
-            ];
-            
-            return response()->json([
-                'employeeId' => $employee->id,
-                'employeeName' => $employee->full_name,
-                'employeePosition' => $employee->position?->name ?? 'Не указана',
-                'brigade' => $employee->brigade?->name ?? 'Не указана',
-                'trainings' => $trainings,
-                'statistics' => $stats
-            ], 200);
+            return response()->json($result, 200);
             
         } catch (ModelNotFoundException $e) {
-            return response()->json([
-                'error' => 'Employee not found'
-            ], 404);
+            return response()->json(['error' => 'Employee not found'], 404);
         } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to fetch employee trainings',
-                'message' => $e->getMessage()
-            ], 500);
+            return response()->json(['error' => 'Failed to fetch employee trainings', 'message' => $e->getMessage()], 500);
         }
     }
     
@@ -271,63 +220,60 @@ class TrainingController extends Controller
     public function getBrigadeTrainings($brigadeId)
     {
         try {
-            $brigade = Brigade::findOrFail($brigadeId);
+            $cacheKey = "brigade_trainings_{$brigadeId}";
             
-            $employees = Employee::with(['position', 'employeeCourses.course'])
-                ->where('brigade_id', $brigadeId)
-                ->get();
-            
-            $result = [];
-            foreach ($employees as $employee) {
-                $totalCourses = $employee->employeeCourses->count();
-                $compliantCourses = $employee->employeeCourses
-                    ->whereNotIn('status', ['expired'])
-                    ->count();
+            $result = Cache::remember($cacheKey, now()->addMinutes($this->cacheTTL), function() use ($brigadeId) {
+                $brigade = Brigade::findOrFail($brigadeId);
                 
-                $compliance = $totalCourses > 0 
-                    ? round(($compliantCourses / $totalCourses) * 100) 
-                    : 0;
+                $employees = Employee::with(['position', 'employeeCourses.course'])
+                    ->where('brigade_id', $brigadeId)
+                    ->get();
                 
-                $trainings = $employee->employeeCourses->map(function($training) {
-                    return [
-                        'id' => $training->id,
-                        'name' => $training->course?->name,
-                        'status' => $training->status,
-                        'assignedDate' => $training->assigned_date?->format('Y-m-d'),
-                        'expiresDate' => $training->expiration_date?->format('Y-m-d'),
-                        'daysLeft' => $training->expiration_date 
-                            ? now()->diffInDays($training->expiration_date, false) 
-                            : null
+                $result = [];
+                foreach ($employees as $employee) {
+                    $totalCourses = $employee->employeeCourses->count();
+                    $compliantCourses = $employee->employeeCourses
+                        ->whereNotIn('status', ['expired'])
+                        ->count();
+                    
+                    $compliance = $totalCourses > 0 ? round(($compliantCourses / $totalCourses) * 100) : 0;
+                    
+                    $trainings = $employee->employeeCourses->map(function($training) {
+                        return [
+                            'id' => $training->id,
+                            'name' => $training->course?->name,
+                            'status' => $training->status,
+                            'assignedDate' => $training->assigned_date?->format('Y-m-d'),
+                            'expiresDate' => $training->expiration_date?->format('Y-m-d'),
+                            'daysLeft' => $training->expiration_date ? now()->diffInDays($training->expiration_date, false) : null
+                        ];
+                    });
+                    
+                    $result[] = [
+                        'employeeId' => $employee->id,
+                        'name' => $employee->full_name,
+                        'position' => $employee->position?->name ?? 'Не указана',
+                        'compliance' => $compliance,
+                        'trainings' => $trainings,
+                        'totalTrainings' => $totalCourses,
+                        'expiredCount' => $employee->employeeCourses->where('status', 'expired')->count()
                     ];
-                });
+                }
                 
-                $result[] = [
-                    'employeeId' => $employee->id,
-                    'name' => $employee->full_name,
-                    'position' => $employee->position?->name ?? 'Не указана',
-                    'compliance' => $compliance,
-                    'trainings' => $trainings,
-                    'totalTrainings' => $totalCourses,
-                    'expiredCount' => $employee->employeeCourses->where('status', 'expired')->count()
+                return [
+                    'brigadeId' => $brigade->id,
+                    'brigadeName' => $brigade->name,
+                    'totalEmployees' => $employees->count(),
+                    'employees' => $result
                 ];
-            }
+            });
             
-            return response()->json([
-                'brigadeId' => $brigade->id,
-                'brigadeName' => $brigade->name,
-                'totalEmployees' => $employees->count(),
-                'employees' => $result
-            ], 200);
+            return response()->json($result, 200);
             
         } catch (ModelNotFoundException $e) {
-            return response()->json([
-                'error' => 'Brigade not found'
-            ], 404);
+            return response()->json(['error' => 'Brigade not found'], 404);
         } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to fetch brigade trainings',
-                'message' => $e->getMessage()
-            ], 500);
+            return response()->json(['error' => 'Failed to fetch brigade trainings', 'message' => $e->getMessage()], 500);
         }
     }
     
@@ -341,8 +287,8 @@ class TrainingController extends Controller
             
             $validator = Validator::make($request->all(), [
                 'certificate_file' => 'nullable|file|mimes:pdf,jpg,jpeg,png|max:5120',
-                'certificate_number' => 'nullable|string|max:100',  // Добавлено
-                'regulatory_acts' => 'nullable|string',             // Добавлено
+                'certificate_number' => 'nullable|string|max:100',
+                'regulatory_acts' => 'nullable|string',
                 'completed_date' => 'nullable|date'
             ]);
             
@@ -355,33 +301,27 @@ class TrainingController extends Controller
             
             DB::beginTransaction();
             
-            // Загружаем сертификат если есть
             $certificatePath = null;
             if ($request->hasFile('certificate_file')) {
-                $certificatePath = $request->file('certificate_file')
-                    ->store('certificates', 'public');
+                $certificatePath = $request->file('certificate_file')->store('certificates', 'public');
             } elseif ($request->has('certificate_path')) {
                 $certificatePath = $request->certificate_path;
             }
             
-            // Рассчитываем новую дату истечения
             $course = $training->course;
             $periodicityMonths = $course?->periodicity_months ?? 12;
             
-            // Преобразуем дату завершения
             $completedDate = $request->has('completed_date')
-                ? \Carbon\Carbon::parse($request->completed_date)
+                ? Carbon::parse($request->completed_date)
                 : now();
             
             $newExpirationDate = $completedDate->copy()->addMonths($periodicityMonths);
             
-            // Обновляем запись
             $training->status = 'active';
             $training->completed_date = $completedDate;
             $training->expiration_date = $newExpirationDate;
             $training->certificate_file_path = $certificatePath;
             
-            // Добавляем новые поля
             if ($request->has('certificate_number')) {
                 $training->certificate_number = $request->certificate_number;
             }
@@ -394,6 +334,9 @@ class TrainingController extends Controller
             
             DB::commit();
             
+            // Очищаем кэш после изменения
+            $this->clearTrainingCache($training->employee_id, $training->course_id);
+            
             return response()->json([
                 'success' => true,
                 'message' => 'Обучение отмечено как пройденное',
@@ -405,18 +348,11 @@ class TrainingController extends Controller
             
         } catch (ModelNotFoundException $e) {
             DB::rollBack();
-            return response()->json([
-                'success' => false,
-                'message' => 'Training not found'
-            ], 404);
+            return response()->json(['success' => false, 'message' => 'Training not found'], 404);
         } catch (\Exception $e) {
             DB::rollBack();
             \Log::error('Complete training error: ' . $e->getMessage());
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to complete training',
-                'error' => $e->getMessage()
-            ], 500);
+            return response()->json(['success' => false, 'message' => 'Failed to complete training', 'error' => $e->getMessage()], 500);
         }
     }
     
@@ -440,34 +376,30 @@ class TrainingController extends Controller
                 ], 422);
             }
             
-            // Сохраняем старую дату до обновления
             $oldExpirationDate = $training->expiration_date;
             
-            // Рассчитываем новую дату истечения
             if ($request->has('new_expiration_date')) {
-                // Преобразуем строку в объект Carbon
-                $newExpirationDate = \Carbon\Carbon::parse($request->new_expiration_date);
+                $newExpirationDate = Carbon::parse($request->new_expiration_date);
             } else {
                 $months = $request->get('months', 12);
                 $newExpirationDate = now()->addMonths($months);
             }
             
-            // Обновляем запись
             $training->expiration_date = $newExpirationDate;
             $training->status = 'active';
             $training->save();
             
-            // Рассчитываем количество дней до истечения
             $daysLeft = now()->diffInDays($newExpirationDate, false);
             
-            // Форматируем даты для ответа, проверяя их наличие
             $formattedOldDate = null;
             if ($oldExpirationDate) {
-                // Если oldExpirationDate уже Carbon объект, используем его, иначе парсим
-                $formattedOldDate = $oldExpirationDate instanceof \Carbon\Carbon 
+                $formattedOldDate = $oldExpirationDate instanceof Carbon 
                     ? $oldExpirationDate->format('Y-m-d')
-                    : \Carbon\Carbon::parse($oldExpirationDate)->format('Y-m-d');
+                    : Carbon::parse($oldExpirationDate)->format('Y-m-d');
             }
+            
+            // Очищаем кэш после изменения
+            $this->clearTrainingCache($training->employee_id, $training->course_id);
             
             return response()->json([
                 'success' => true,
@@ -478,17 +410,10 @@ class TrainingController extends Controller
             ], 200);
             
         } catch (ModelNotFoundException $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Training not found'
-            ], 404);
+            return response()->json(['success' => false, 'message' => 'Training not found'], 404);
         } catch (\Exception $e) {
             \Log::error('Extend training error: ' . $e->getMessage());
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to extend training',
-                'error' => $e->getMessage()
-            ], 500);
+            return response()->json(['success' => false, 'message' => 'Failed to extend training', 'error' => $e->getMessage()], 500);
         }
     }
     
@@ -512,7 +437,6 @@ class TrainingController extends Controller
                 ], 422);
             }
             
-            // Проверяем, нет ли уже назначения
             $existing = EmployeeCourse::where('employee_id', $request->employee_id)
                 ->where('course_id', $request->course_id)
                 ->first();
@@ -527,14 +451,13 @@ class TrainingController extends Controller
             
             $course = Course::find($request->course_id);
             
-            // Обработка дат - преобразуем строки в объекты Carbon
             $assignedDate = $request->has('assigned_date') 
-                ? \Carbon\Carbon::parse($request->assigned_date) 
+                ? Carbon::parse($request->assigned_date) 
                 : now();
             
             $expirationDate = null;
             if ($request->has('expiration_date')) {
-                $expirationDate = \Carbon\Carbon::parse($request->expiration_date);
+                $expirationDate = Carbon::parse($request->expiration_date);
             } elseif ($course && $course->periodicity_months) {
                 $expirationDate = $assignedDate->copy()->addMonths($course->periodicity_months);
             }
@@ -548,15 +471,16 @@ class TrainingController extends Controller
                 'last_reminder_sent' => null
             ]);
             
-            // Проверяем, требует ли внимания (истекает в ближайшие 30 дней)
             $needsAttention = false;
             if ($expirationDate) {
                 $daysLeft = now()->diffInDays($expirationDate, false);
                 $needsAttention = $daysLeft <= 30 && $daysLeft >= 0;
             }
             
-            // Форматируем даты для ответа
             $formattedExpirationDate = $expirationDate ? $expirationDate->format('Y-m-d') : null;
+            
+            // Очищаем кэш после создания
+            $this->clearTrainingCache($request->employee_id, $request->course_id);
             
             return response()->json([
                 'success' => true,
@@ -569,11 +493,7 @@ class TrainingController extends Controller
             
         } catch (\Exception $e) {
             \Log::error('Assign training error: ' . $e->getMessage());
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to assign training',
-                'error' => $e->getMessage()
-            ], 500);
+            return response()->json(['success' => false, 'message' => 'Failed to assign training', 'error' => $e->getMessage()], 500);
         }
     }
     
@@ -606,10 +526,10 @@ class TrainingController extends Controller
             $assigned = 0;
             $failed = 0;
             $details = [];
+            $affectedEmployeeIds = [];
             
             foreach ($request->employee_ids as $employeeId) {
                 try {
-                    // Проверяем, нет ли уже назначения
                     $existing = EmployeeCourse::where('employee_id', $employeeId)
                         ->where('course_id', $request->course_id)
                         ->first();
@@ -638,6 +558,7 @@ class TrainingController extends Controller
                         'status' => 'assigned'
                     ];
                     $assigned++;
+                    $affectedEmployeeIds[] = $employeeId;
                     
                 } catch (\Exception $e) {
                     $details[] = [
@@ -649,6 +570,11 @@ class TrainingController extends Controller
                 }
             }
             
+            // Очищаем кэш для всех затронутых сотрудников
+            foreach ($affectedEmployeeIds as $employeeId) {
+                $this->clearTrainingCache($employeeId, $request->course_id);
+            }
+            
             return response()->json([
                 'success' => true,
                 'assigned' => $assigned,
@@ -658,11 +584,7 @@ class TrainingController extends Controller
             ], 200);
             
         } catch (\Exception $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to bulk assign trainings',
-                'error' => $e->getMessage()
-            ], 500);
+            return response()->json(['success' => false, 'message' => 'Failed to bulk assign trainings', 'error' => $e->getMessage()], 500);
         }
     }
     
@@ -672,52 +594,36 @@ class TrainingController extends Controller
     public function getStatistics()
     {
         try {
-            $today = now();
-            $expiring30Date = now()->addDays(30);
-            $expiring60Date = now()->addDays(60);
+            $cacheKey = 'trainings_statistics';
             
-            $expired = EmployeeCourse::where('status', 'expired')
-                ->whereNotNull('expiration_date')
-                ->where('expiration_date', '<', $today)
-                ->count();
+            $result = Cache::remember($cacheKey, now()->addMinutes($this->longCacheTTL), function() {
+                $today = now();
+                $expiring30Date = now()->addDays(30);
+                $expiring60Date = now()->addDays(60);
+                
+                $expired = EmployeeCourse::where('status', 'expired')->whereNotNull('expiration_date')->where('expiration_date', '<', $today)->count();
+                $expiring30 = EmployeeCourse::where('status', 'active')->whereNotNull('expiration_date')->whereBetween('expiration_date', [$today, $expiring30Date])->count();
+                $expiring60 = EmployeeCourse::where('status', 'active')->whereNotNull('expiration_date')->whereBetween('expiration_date', [$expiring30Date, $expiring60Date])->count();
+                $active = EmployeeCourse::where('status', 'active')->where(fn($q) => $q->whereNull('expiration_date')->orWhere('expiration_date', '>', $today))->count();
+                $required = EmployeeCourse::count();
+                $noData = Employee::whereDoesntHave('employeeCourses')->count();
+                
+                return [
+                    'expired' => $expired,
+                    'expiring30' => $expiring30,
+                    'expiring60' => $expiring60,
+                    'active' => $active,
+                    'required' => $required,
+                    'noData' => $noData,
+                    'totalEmployees' => Employee::count(),
+                    'totalCourses' => Course::count()
+                ];
+            });
             
-            $expiring30 = EmployeeCourse::where('status', 'active')
-                ->whereNotNull('expiration_date')
-                ->whereBetween('expiration_date', [$today, $expiring30Date])
-                ->count();
-            
-            $expiring60 = EmployeeCourse::where('status', 'active')
-                ->whereNotNull('expiration_date')
-                ->whereBetween('expiration_date', [$expiring30Date, $expiring60Date])
-                ->count();
-            
-            $active = EmployeeCourse::where('status', 'active')
-                ->where(function($q) use ($today) {
-                    $q->whereNull('expiration_date')
-                      ->orWhere('expiration_date', '>', $today);
-                })
-                ->count();
-            
-            $required = EmployeeCourse::count();
-            
-            $noData = Employee::whereDoesntHave('employeeCourses')->count();
-            
-            return response()->json([
-                'expired' => $expired,
-                'expiring30' => $expiring30,
-                'expiring60' => $expiring60,
-                'active' => $active,
-                'required' => $required,
-                'noData' => $noData,
-                'totalEmployees' => Employee::count(),
-                'totalCourses' => Course::count()
-            ], 200);
+            return response()->json($result, 200);
             
         } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to fetch statistics',
-                'message' => $e->getMessage()
-            ], 500);
+            return response()->json(['error' => 'Failed to fetch statistics', 'message' => $e->getMessage()], 500);
         }
     }
     
@@ -734,12 +640,9 @@ class TrainingController extends Controller
             
             if ($status) {
                 if ($status === 'expired') {
-                    $query->where('status', 'expired')
-                          ->where('expiration_date', '<', now());
+                    $query->where('status', 'expired')->where('expiration_date', '<', now());
                 } elseif ($status === 'expiring') {
-                    $query->where('status', 'active')
-                          ->whereNotNull('expiration_date')
-                          ->whereBetween('expiration_date', [now(), now()->addDays(30)]);
+                    $query->where('status', 'active')->whereNotNull('expiration_date')->whereBetween('expiration_date', [now(), now()->addDays(30)]);
                 } else {
                     $query->where('status', $status);
                 }
@@ -758,9 +661,7 @@ class TrainingController extends Controller
                     'Дата назначения' => $training->assigned_date?->format('Y-m-d'),
                     'Дата завершения' => $training->completed_date?->format('Y-m-d'),
                     'Дата истечения' => $training->expiration_date?->format('Y-m-d'),
-                    'Дней до истечения' => $training->expiration_date 
-                        ? now()->diffInDays($training->expiration_date, false) 
-                        : null
+                    'Дней до истечения' => $training->expiration_date ? now()->diffInDays($training->expiration_date, false) : null
                 ];
             });
             
@@ -773,35 +674,22 @@ class TrainingController extends Controller
                 
                 $callback = function() use ($data) {
                     $file = fopen('php://output', 'w');
-                    
-                    // Заголовки
                     if ($data->isNotEmpty()) {
                         fputcsv($file, array_keys($data->first()));
                     }
-                    
-                    // Данные
                     foreach ($data as $row) {
                         fputcsv($file, $row);
                     }
-                    
                     fclose($file);
                 };
                 
                 return response()->stream($callback, 200, $headers);
-                
-            } else {
-                // Excel формат (можно использовать Laravel Excel)
-                return response()->json([
-                    'message' => 'Excel export not implemented yet. Use CSV format.',
-                    'data' => $data
-                ], 200);
             }
             
+            return response()->json(['message' => 'Excel export not implemented yet. Use CSV format.', 'data' => $data], 200);
+            
         } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to export trainings',
-                'message' => $e->getMessage()
-            ], 500);
+            return response()->json(['error' => 'Failed to export trainings', 'message' => $e->getMessage()], 500);
         }
     }
     
@@ -815,51 +703,40 @@ class TrainingController extends Controller
             $limit = $request->get('limit', 20);
             $query = $request->get('query', '');
             
-            $trainingsQuery = EmployeeCourse::with(['employee', 'course', 'employee.position', 'employee.brigade'])
-                ->whereHas('employee', function($q) use ($query) {
-                    $q->where('full_name', 'LIKE', "%{$query}%");
-                })
-                ->orWhereHas('course', function($q) use ($query) {
-                    $q->where('name', 'LIKE', "%{$query}%");
-                });
+            $cacheKey = "trainings_search_" . md5($query . $page . $limit);
             
-            $total = $trainingsQuery->count();
-            $hasMore = ($page * $limit) < $total;
+            $result = Cache::remember($cacheKey, now()->addMinutes($this->cacheTTL), function() use ($query, $page, $limit) {
+                $trainingsQuery = EmployeeCourse::with(['employee', 'course', 'employee.position', 'employee.brigade'])
+                    ->whereHas('employee', fn($q) => $q->where('full_name', 'LIKE', "%{$query}%"))
+                    ->orWhereHas('course', fn($q) => $q->where('name', 'LIKE', "%{$query}%"));
+                
+                $total = $trainingsQuery->count();
+                $hasMore = ($page * $limit) < $total;
+                
+                $trainings = $trainingsQuery->skip(($page - 1) * $limit)->take($limit)->get()
+                    ->map(fn($training) => [
+                        'id' => $training->id,
+                        'employeeName' => $training->employee->full_name,
+                        'employeeId' => $training->employee_id,
+                        'trainingName' => $training->course?->name,
+                        'trainingId' => $training->course_id,
+                        'status' => $training->status,
+                        'expiresDate' => $training->expiration_date?->format('Y-m-d'),
+                        'brigade' => $training->employee->brigade?->name
+                    ]);
+                
+                return compact('trainings', 'total', 'page', 'limit', 'hasMore');
+            });
             
-            $trainings = $trainingsQuery->skip(($page - 1) * $limit)
-                                        ->take($limit)
-                                        ->get()
-                                        ->map(function($training) {
-                                            return [
-                                                'id' => $training->id,
-                                                'employeeName' => $training->employee->full_name,
-                                                'employeeId' => $training->employee_id,
-                                                'trainingName' => $training->course?->name,
-                                                'trainingId' => $training->course_id,
-                                                'status' => $training->status,
-                                                'expiresDate' => $training->expiration_date?->format('Y-m-d'),
-                                                'brigade' => $training->employee->brigade?->name
-                                            ];
-                                        });
-            
-            return response()->json([
-                'trainings' => $trainings,
-                'total' => $total,
-                'page' => $page,
-                'limit' => $limit,
-                'hasMore' => $hasMore
-            ], 200);
+            return response()->json($result, 200);
             
         } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Search failed',
-                'message' => $e->getMessage()
-            ], 500);
+            return response()->json(['error' => 'Search failed', 'message' => $e->getMessage()], 500);
         }
     }
-
+    
     /**
-     * PUT /trainings/{id}/certificate - Обновление информации о сертификате (номер + НПА + файл)
+     * PUT /trainings/{id}/certificate - Обновление информации о сертификате
      */
     public function updateCertificateInfo(Request $request, $id)
     {
@@ -874,30 +751,22 @@ class TrainingController extends Controller
             ]);
             
             if ($validator->fails()) {
-                return response()->json([
-                    'error' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
+                return response()->json(['error' => 'Validation failed', 'errors' => $validator->errors()], 422);
             }
             
             DB::beginTransaction();
             
-            // Обновляем номер удостоверения
             if ($request->has('certificate_number')) {
                 $training->certificate_number = $request->certificate_number;
             }
             
-            // Обновляем НПА
             if ($request->has('regulatory_acts')) {
                 $training->regulatory_acts = $request->regulatory_acts;
             }
             
-            // Обновляем дату завершения
             if ($request->has('completed_date')) {
-                $completedDate = \Carbon\Carbon::parse($request->completed_date);
+                $completedDate = Carbon::parse($request->completed_date);
                 $training->completed_date = $completedDate;
-                
-                // Пересчитываем дату истечения
                 $course = $training->course;
                 $periodicityMonths = $course?->periodicity_months ?? 12;
                 $newExpirationDate = $completedDate->copy()->addMonths($periodicityMonths);
@@ -905,13 +774,10 @@ class TrainingController extends Controller
                 $training->status = 'active';
             }
             
-            // Загружаем файл сертификата
             if ($request->hasFile('certificate_file')) {
-                // Удаляем старый файл если есть
                 if ($training->certificate_file_path && \Storage::disk('public')->exists($training->certificate_file_path)) {
                     \Storage::disk('public')->delete($training->certificate_file_path);
                 }
-                
                 $certificatePath = $request->file('certificate_file')->store('certificates', 'public');
                 $training->certificate_file_path = $certificatePath;
             }
@@ -919,6 +785,9 @@ class TrainingController extends Controller
             $training->save();
             
             DB::commit();
+            
+            // Очищаем кэш после изменения
+            $this->clearTrainingCache($training->employee_id, $training->course_id);
             
             return response()->json([
                 'success' => true,
@@ -935,21 +804,14 @@ class TrainingController extends Controller
             
         } catch (ModelNotFoundException $e) {
             DB::rollBack();
-            return response()->json([
-                'success' => false,
-                'message' => 'Training not found'
-            ], 404);
+            return response()->json(['success' => false, 'message' => 'Training not found'], 404);
         } catch (\Exception $e) {
             DB::rollBack();
             \Log::error('Update certificate error: ' . $e->getMessage());
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to update certificate info',
-                'error' => $e->getMessage()
-            ], 500);
+            return response()->json(['success' => false, 'message' => 'Failed to update certificate info', 'error' => $e->getMessage()], 500);
         }
     }
-
+    
     /**
      * PATCH /trainings/{id}/certificate-number - Обновление только номера удостоверения
      */
@@ -963,14 +825,14 @@ class TrainingController extends Controller
             ]);
             
             if ($validator->fails()) {
-                return response()->json([
-                    'error' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
+                return response()->json(['error' => 'Validation failed', 'errors' => $validator->errors()], 422);
             }
             
             $training->certificate_number = $request->certificate_number;
             $training->save();
+            
+            // Очищаем кэш после изменения
+            $this->clearTrainingCache($training->employee_id, $training->course_id);
             
             return response()->json([
                 'success' => true,
@@ -984,20 +846,12 @@ class TrainingController extends Controller
             ], 200);
             
         } catch (ModelNotFoundException $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Training not found'
-            ], 404);
+            return response()->json(['success' => false, 'message' => 'Training not found'], 404);
         } catch (\Exception $e) {
-            \Log::error('Update certificate number error: ' . $e->getMessage());
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to update certificate number',
-                'error' => $e->getMessage()
-            ], 500);
+            return response()->json(['success' => false, 'message' => 'Failed to update certificate number', 'error' => $e->getMessage()], 500);
         }
     }
-
+    
     /**
      * PATCH /trainings/{id}/regulatory-acts - Обновление только НПА
      */
@@ -1011,14 +865,14 @@ class TrainingController extends Controller
             ]);
             
             if ($validator->fails()) {
-                return response()->json([
-                    'error' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
+                return response()->json(['error' => 'Validation failed', 'errors' => $validator->errors()], 422);
             }
             
             $training->regulatory_acts = $request->regulatory_acts;
             $training->save();
+            
+            // Очищаем кэш после изменения
+            $this->clearTrainingCache($training->employee_id, $training->course_id);
             
             return response()->json([
                 'success' => true,
@@ -1032,1101 +886,248 @@ class TrainingController extends Controller
             ], 200);
             
         } catch (ModelNotFoundException $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'Training not found'
-            ], 404);
+            return response()->json(['success' => false, 'message' => 'Training not found'], 404);
         } catch (\Exception $e) {
-            \Log::error('Update regulatory acts error: ' . $e->getMessage());
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to update regulatory acts',
-                'error' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-   /**
-     * GET /trainings/dashboard/expired-by-course - Просроченные обучения по курсам (для карточки 🔴)
-     * 
-     * @param string|null period - month (за текущий месяц), two_months (за два месяца), null (все)
-     */
-    public function getExpiredByCourse(Request $request)
-    {
-        try {
-            $period = $request->get('period'); // month, two_months, или null (все)
-            $today = now();
-            
-            $query = EmployeeCourse::with(['course', 'employee'])
-                ->where('status', 'expired')
-                ->whereNotNull('expiration_date')
-                ->where('expiration_date', '<', $today);
-            
-            // Фильтр по периоду
-            if ($period === 'month') {
-                // За текущий месяц (с начала месяца)
-                $query->where('expiration_date', '>=', $today->copy()->startOfMonth());
-            } elseif ($period === 'two_months') {
-                // За два месяца
-                $query->where('expiration_date', '>=', $today->copy()->subMonths(2)->startOfMonth());
-            }
-            
-            // Фильтр по бригаде
-            if ($request->has('brigade_id')) {
-                $query->whereHas('employee', function($q) use ($request) {
-                    $q->where('brigade_id', $request->brigade_id);
-                });
-            }
-            
-            // Фильтр по подразделению
-            if ($request->has('department_id')) {
-                $query->whereHas('employee', function($q) use ($request) {
-                    $q->where('department_id', $request->department_id);
-                });
-            }
-            
-            // Фильтр по должности
-            if ($request->has('position_id')) {
-                $query->whereHas('employee', function($q) use ($request) {
-                    $q->where('position_id', $request->position_id);
-                });
-            }
-            
-            // Получаем все записи
-            $expiredRecords = $query->get();
-            
-            // Группируем по курсам
-            $expiredByCourse = $expiredRecords
-                ->groupBy('course_id')
-                ->map(function($items, $courseId) {
-                    $course = $items->first()->course;
-                    $uniqueEmployees = $items->unique('employee_id');
-                    
-                    // Получаем минимальную дату просрочки
-                    $minExpiredDate = $items->min('expiration_date');
-                    $maxExpiredDate = $items->max('expiration_date');
-                    
-                    return [
-                        'course_id' => $courseId,
-                        'course_name' => $course?->name ?? 'Неизвестный курс',
-                        'course_category' => $course?->category?->name,
-                        'course_subcategory' => $course?->subcategory,
-                        'expired_count' => $items->count(),
-                        'employees_count' => $uniqueEmployees->count(),
-                        'min_expired_date' => $minExpiredDate?->format('Y-m-d'),
-                        'max_expired_date' => $maxExpiredDate?->format('Y-m-d'),
-                        'employees' => $uniqueEmployees->map(function($item) {
-                            $fullName = trim(implode(' ', array_filter([
-                                $item->employee->last_name,
-                                $item->employee->first_name,
-                                $item->employee->middle_name
-                            ])));
-                            
-                            return [
-                                'id' => $item->employee->id,
-                                'name' => $fullName ?: $item->employee->full_name,
-                                'personnel_number' => $item->employee->personnel_number,
-                                'position' => $item->employee->position?->name,
-                                'department' => $item->employee->department?->name,
-                                'brigade' => $item->employee->brigade?->name,
-                                'expired_date' => $item->expiration_date?->format('Y-m-d'),
-                                'days_overdue' => abs(now()->diffInDays($item->expiration_date, false))
-                            ];
-                        })->values()
-                    ];
-                })
-                ->values()
-                ->sortByDesc('expired_count')
-                ->values();
-            
-            $totalExpired = $expiredByCourse->sum('expired_count');
-            $totalEmployees = $expiredByCourse->sum('employees_count');
-            
-            // Формируем карточки для отображения
-            $cards = $expiredByCourse->map(function($item) {
-                $level = 'danger';
-                if ($item['expired_count'] <= 2) {
-                    $level = 'warning';
-                } elseif ($item['expired_count'] <= 5) {
-                    $level = 'danger';
-                } else {
-                    $level = 'critical';
-                }
-                
-                return [
-                    'title' => $item['course_name'],
-                    'count' => $item['expired_count'],
-                    'employees_count' => $item['employees_count'],
-                    'type' => 'expired',
-                    'level' => $level,
-                    'color' => $this->getExpiredColor($level),
-                    'course_id' => $item['course_id']
-                ];
-            });
-            
-            // Дополнительная статистика
-            $topEmployees = $expiredRecords
-                ->groupBy('employee_id')
-                ->map(function($items, $employeeId) {
-                    $employee = $items->first()->employee;
-                    $fullName = trim(implode(' ', array_filter([
-                        $employee->last_name,
-                        $employee->first_name,
-                        $employee->middle_name
-                    ])));
-                    
-                    return [
-                        'id' => $employeeId,
-                        'name' => $fullName ?: $employee->full_name,
-                        'personnel_number' => $employee->personnel_number,
-                        'position' => $employee->position?->name,
-                        'department' => $employee->department?->name,
-                        'expired_count' => $items->count(),
-                        'courses' => $items->map(function($item) {
-                            return [
-                                'course_id' => $item->course_id,
-                                'course_name' => $item->course?->name,
-                                'expired_date' => $item->expiration_date?->format('Y-m-d'),
-                                'days_overdue' => abs(now()->diffInDays($item->expiration_date, false))
-                            ];
-                        })->values()
-                    ];
-                })
-                ->sortByDesc('expired_count')
-                ->take(10)
-                ->values();
-            
-            return response()->json([
-                'period' => $period ?: 'all',
-                'period_label' => $this->getPeriodLabel($period),
-                'total_expired' => $totalExpired,
-                'total_employees_affected' => $totalEmployees,
-                'by_course' => $expiredByCourse,
-                'cards' => $cards,
-                'top_employees' => $topEmployees,
-                'filters' => [
-                    'available_periods' => ['all', 'month', 'two_months']
-                ]
-            ], 200);
-            
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to fetch expired by course',
-                'message' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-    /**
-     * GET /trainings/dashboard/expiring-by-period - Истекающие обучения по периодам (объединенный метод)
-     */
-    public function getExpiringByPeriod(Request $request)
-    {
-        try {
-            $period = $request->get('period', 'month'); // month, two_months
-            $today = now();
-            
-            if ($period === 'month') {
-                $startDate = $today;
-                $endDate = $today->copy()->addDays(30);
-                $periodLabel = 'Ближайший месяц';
-                $periodKey = '30_days';
-            } elseif ($period === 'two_months') {
-                $startDate = $today->copy()->addDays(31);
-                $endDate = $today->copy()->addDays(60);
-                $periodLabel = 'Через 1-2 месяца';
-                $periodKey = '31_60_days';
-            } else {
-                $startDate = $today;
-                $endDate = $today->copy()->addDays(30);
-                $periodLabel = 'Ближайший месяц';
-                $periodKey = '30_days';
-            }
-            
-            $query = EmployeeCourse::with(['course', 'employee', 'employee.position', 'employee.department', 'employee.brigade'])
-                ->where('status', 'active')
-                ->whereNotNull('expiration_date')
-                ->whereBetween('expiration_date', [$startDate, $endDate])
-                ->orderBy('expiration_date', 'asc');
-            
-            // Фильтры
-            if ($request->has('brigade_id')) {
-                $query->whereHas('employee', function($q) use ($request) {
-                    $q->where('brigade_id', $request->brigade_id);
-                });
-            }
-            
-            if ($request->has('department_id')) {
-                $query->whereHas('employee', function($q) use ($request) {
-                    $q->where('department_id', $request->department_id);
-                });
-            }
-            
-            if ($request->has('position_id')) {
-                $query->whereHas('employee', function($q) use ($request) {
-                    $q->where('position_id', $request->position_id);
-                });
-            }
-            
-            $expiringRecords = $query->get();
-            
-            // Группируем по курсам
-            $expiringByCourse = $expiringRecords
-                ->groupBy('course_id')
-                ->map(function($items, $courseId) use ($periodKey) {
-                    $course = $items->first()->course;
-                    $uniqueEmployees = $items->unique('employee_id');
-                    $minDaysLeft = $items->min(function($item) {
-                        return now()->diffInDays($item->expiration_date, false);
-                    });
-                    $maxDaysLeft = $items->max(function($item) {
-                        return now()->diffInDays($item->expiration_date, false);
-                    });
-                    
-                    // Группируем по срочности
-                    $urgentCount = $items->filter(function($item) {
-                        return now()->diffInDays($item->expiration_date, false) <= 14;
-                    })->count();
-                    
-                    return [
-                        'course_id' => $courseId,
-                        'course_name' => $course?->name ?? 'Неизвестный курс',
-                        'course_category' => $course?->category?->name,
-                        'expiring_count' => $items->count(),
-                        'employees_count' => $uniqueEmployees->count(),
-                        'urgent_count' => $urgentCount,
-                        'min_days_left' => max(0, (int)$minDaysLeft),
-                        'max_days_left' => max(0, (int)$maxDaysLeft),
-                        'employees' => $uniqueEmployees->map(function($item) use ($periodKey) {
-                            $fullName = trim(implode(' ', array_filter([
-                                $item->employee->last_name,
-                                $item->employee->first_name,
-                                $item->employee->middle_name
-                            ])));
-                            $daysLeft = now()->diffInDays($item->expiration_date, false);
-                            
-                            return [
-                                'id' => $item->employee->id,
-                                'name' => $fullName ?: $item->employee->full_name,
-                                'personnel_number' => $item->employee->personnel_number,
-                                'position' => $item->employee->position?->name,
-                                'department' => $item->employee->department?->name,
-                                'brigade' => $item->employee->brigade?->name,
-                                'expires_date' => $item->expiration_date?->format('Y-m-d'),
-                                'days_left' => max(0, $daysLeft),
-                                'status_level' => $this->getExpiryStatus($daysLeft)
-                            ];
-                        })->values()
-                    ];
-                })
-                ->values()
-                ->sortBy('min_days_left')
-                ->values();
-            
-            $totalExpiring = $expiringByCourse->sum('expiring_count');
-            $totalEmployees = $expiringByCourse->sum('employees_count');
-            $totalUrgent = $expiringByCourse->sum('urgent_count');
-            
-            // Формируем карточки
-            $cards = $expiringByCourse->map(function($item) {
-                $level = 'normal';
-                if ($item['min_days_left'] <= 7) {
-                    $level = 'critical';
-                } elseif ($item['min_days_left'] <= 14) {
-                    $level = 'urgent';
-                } elseif ($item['min_days_left'] <= 30) {
-                    $level = 'warning';
-                }
-                
-                return [
-                    'title' => $item['course_name'],
-                    'count' => $item['expiring_count'],
-                    'employees_count' => $item['employees_count'],
-                    'type' => 'expiring',
-                    'level' => $level,
-                    'days_left' => $item['min_days_left'],
-                    'color' => $this->getExpiringColor($level),
-                    'course_id' => $item['course_id']
-                ];
-            });
-            
-            return response()->json([
-                'period' => $periodKey,
-                'period_label' => $periodLabel,
-                'date_range' => [
-                    'from' => $startDate->format('Y-m-d'),
-                    'to' => $endDate->format('Y-m-d')
-                ],
-                'total_expiring' => $totalExpiring,
-                'total_employees_affected' => $totalEmployees,
-                'total_urgent' => $totalUrgent,
-                'by_course' => $expiringByCourse,
-                'cards' => $cards
-            ], 200);
-            
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to fetch expiring by period',
-                'message' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-    /**
-     * Получить цвет для уровня просрочки
-     */
-    private function getExpiredColor($level)
-    {
-        $colors = [
-            'warning' => '#f59e0b',
-            'danger' => '#ef4444',
-            'critical' => '#dc2626'
-        ];
-        return $colors[$level] ?? '#ef4444';
-    }
-
-    /**
-     * Получить цвет для уровня истечения
-     */
-    private function getExpiringColor($level)
-    {
-        $colors = [
-            'normal' => '#10b981',
-            'warning' => '#f59e0b',
-            'urgent' => '#f97316',
-            'critical' => '#ef4444'
-        ];
-        return $colors[$level] ?? '#f59e0b';
-    }
-
-    /**
-     * Получить название периода
-     */
-    private function getPeriodLabel($period)
-    {
-        $labels = [
-            'month' => 'За текущий месяц',
-            'two_months' => 'За два месяца',
-            'all' => 'За все время'
-        ];
-        return $labels[$period] ?? 'За все время';
-    }
-    /**
-     * GET /trainings/dashboard/expiring-in-month - Истекающие в ближайший месяц (для карточки 📅)
-     */
-    public function getExpiringInMonth(Request $request)
-    {
-        try {
-            $today = now();
-            $endDate = now()->addDays(30);
-            
-            $query = EmployeeCourse::with(['course', 'employee'])
-                ->where('status', 'active')
-                ->whereNotNull('expiration_date')
-                ->whereBetween('expiration_date', [$today, $endDate])
-                ->orderBy('expiration_date', 'asc');
-            
-            // Фильтр по бригаде
-            if ($request->has('brigade_id')) {
-                $query->whereHas('employee', function($q) use ($request) {
-                    $q->where('brigade_id', $request->brigade_id);
-                });
-            }
-            
-            // Фильтр по подразделению
-            if ($request->has('department_id')) {
-                $query->whereHas('employee', function($q) use ($request) {
-                    $q->where('department_id', $request->department_id);
-                });
-            }
-            
-            $expiringTrainings = $query->get();
-            
-            // Группируем по курсам
-            $expiringByCourse = $expiringTrainings
-                ->groupBy('course_id')
-                ->map(function($items, $courseId) {
-                    $course = $items->first()->course;
-                    $uniqueEmployees = $items->unique('employee_id');
-                    $minDaysLeft = $items->min(function($item) {
-                        return now()->diffInDays($item->expiration_date, false);
-                    });
-                    
-                    return [
-                        'course_id' => $courseId,
-                        'course_name' => $course?->name ?? 'Неизвестный курс',
-                        'expiring_count' => $items->count(),
-                        'employees_count' => $uniqueEmployees->count(),
-                        'min_days_left' => max(0, (int)$minDaysLeft),
-                        'employees' => $uniqueEmployees->map(function($item) {
-                            return [
-                                'id' => $item->employee->id,
-                                'name' => $item->employee->full_name,
-                                'position' => $item->employee->position?->name,
-                                'expires_date' => $item->expiration_date?->format('Y-m-d'),
-                                'days_left' => max(0, now()->diffInDays($item->expiration_date, false))
-                            ];
-                        })->values()
-                    ];
-                })
-                ->values()
-                ->sortBy('min_days_left')
-                ->values();
-            
-            $totalExpiring = $expiringByCourse->sum('expiring_count');
-            $totalEmployees = $expiringByCourse->sum('employees_count');
-            
-            return response()->json([
-                'total_expiring' => $totalExpiring,
-                'total_employees_affected' => $totalEmployees,
-                'period' => '30_days',
-                'by_course' => $expiringByCourse,
-                'cards' => $expiringByCourse->map(function($item) {
-                    return [
-                        'title' => $item['course_name'],
-                        'count' => $item['expiring_count'],
-                        'employees_count' => $item['employees_count'],
-                        'type' => 'expiring',
-                        'days_left' => $item['min_days_left'],
-                        'color' => 'orange'
-                    ];
-                })
-            ], 200);
-            
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to fetch expiring in month',
-                'message' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-    /**
-     * GET /trainings/dashboard/expiring-in-two-months - Истекающие через 1-2 месяца (для карточки 📅)
-     */
-    public function getExpiringInTwoMonths(Request $request)
-    {
-        try {
-            $startDate = now()->addDays(31);
-            $endDate = now()->addDays(60);
-            
-            $query = EmployeeCourse::with(['course', 'employee'])
-                ->where('status', 'active')
-                ->whereNotNull('expiration_date')
-                ->whereBetween('expiration_date', [$startDate, $endDate])
-                ->orderBy('expiration_date', 'asc');
-            
-            // Фильтр по бригаде
-            if ($request->has('brigade_id')) {
-                $query->whereHas('employee', function($q) use ($request) {
-                    $q->where('brigade_id', $request->brigade_id);
-                });
-            }
-            
-            // Фильтр по подразделению
-            if ($request->has('department_id')) {
-                $query->whereHas('employee', function($q) use ($request) {
-                    $q->where('department_id', $request->department_id);
-                });
-            }
-            
-            $expiringTrainings = $query->get();
-            
-            // Группируем по курсам
-            $expiringByCourse = $expiringTrainings
-                ->groupBy('course_id')
-                ->map(function($items, $courseId) {
-                    $course = $items->first()->course;
-                    $uniqueEmployees = $items->unique('employee_id');
-                    $minDaysLeft = $items->min(function($item) {
-                        return now()->diffInDays($item->expiration_date, false);
-                    });
-                    
-                    return [
-                        'course_id' => $courseId,
-                        'course_name' => $course?->name ?? 'Неизвестный курс',
-                        'expiring_count' => $items->count(),
-                        'employees_count' => $uniqueEmployees->count(),
-                        'min_days_left' => max(0, (int)$minDaysLeft),
-                        'employees' => $uniqueEmployees->map(function($item) {
-                            return [
-                                'id' => $item->employee->id,
-                                'name' => $item->employee->full_name,
-                                'position' => $item->employee->position?->name,
-                                'expires_date' => $item->expiration_date?->format('Y-m-d'),
-                                'days_left' => max(0, now()->diffInDays($item->expiration_date, false))
-                            ];
-                        })->values()
-                    ];
-                })
-                ->values()
-                ->sortBy('min_days_left')
-                ->values();
-            
-            $totalExpiring = $expiringByCourse->sum('expiring_count');
-            $totalEmployees = $expiringByCourse->sum('employees_count');
-            
-            return response()->json([
-                'total_expiring' => $totalExpiring,
-                'total_employees_affected' => $totalEmployees,
-                'period' => '31_60_days',
-                'by_course' => $expiringByCourse,
-                'cards' => $expiringByCourse->map(function($item) {
-                    return [
-                        'title' => $item['course_name'],
-                        'count' => $item['expiring_count'],
-                        'employees_count' => $item['employees_count'],
-                        'type' => 'expiring_soon',
-                        'days_left' => $item['min_days_left'],
-                        'color' => 'yellow'
-                    ];
-                })
-            ], 200);
-            
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to fetch expiring in two months',
-                'message' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-    /**
-     * GET /trainings/dashboard/summary - Сводка для карточек дашборда
-     */
-    public function getDashboardSummary(Request $request)
-    {
-        try {
-            $today = now();
-            $monthEnd = now()->addDays(30);
-            $twoMonthsEnd = now()->addDays(60);
-            
-            // Просроченные
-            $expiredQuery = EmployeeCourse::where('status', 'expired')
-                ->whereNotNull('expiration_date')
-                ->where('expiration_date', '<', $today);
-            
-            if ($request->has('brigade_id')) {
-                $expiredQuery->whereHas('employee', function($q) use ($request) {
-                    $q->where('brigade_id', $request->brigade_id);
-                });
-            }
-            
-            $expiredTotal = $expiredQuery->count();
-            $expiredEmployees = $expiredQuery->distinct('employee_id')->count('employee_id');
-            
-            // Истекающие в ближайший месяц
-            $expiringMonthQuery = EmployeeCourse::where('status', 'active')
-                ->whereNotNull('expiration_date')
-                ->whereBetween('expiration_date', [$today, $monthEnd]);
-            
-            if ($request->has('brigade_id')) {
-                $expiringMonthQuery->whereHas('employee', function($q) use ($request) {
-                    $q->where('brigade_id', $request->brigade_id);
-                });
-            }
-            
-            $expiringMonthTotal = $expiringMonthQuery->count();
-            $expiringMonthEmployees = $expiringMonthQuery->distinct('employee_id')->count('employee_id');
-            
-            // Истекающие через 1-2 месяца
-            $expiringTwoMonthsQuery = EmployeeCourse::where('status', 'active')
-                ->whereNotNull('expiration_date')
-                ->whereBetween('expiration_date', [$monthEnd->addDay(), $twoMonthsEnd]);
-            
-            if ($request->has('brigade_id')) {
-                $expiringTwoMonthsQuery->whereHas('employee', function($q) use ($request) {
-                    $q->where('brigade_id', $request->brigade_id);
-                });
-            }
-            
-            $expiringTwoMonthsTotal = $expiringTwoMonthsQuery->count();
-            $expiringTwoMonthsEmployees = $expiringTwoMonthsQuery->distinct('employee_id')->count('employee_id');
-            
-            return response()->json([
-                'expired' => [
-                    'total' => $expiredTotal,
-                    'employees_affected' => $expiredEmployees,
-                    'color' => 'red',
-                    'icon' => '🔴'
-                ],
-                'expiring_month' => [
-                    'total' => $expiringMonthTotal,
-                    'employees_affected' => $expiringMonthEmployees,
-                    'period' => 'Ближайший месяц',
-                    'color' => 'orange',
-                    'icon' => '📅'
-                ],
-                'expiring_two_months' => [
-                    'total' => $expiringTwoMonthsTotal,
-                    'employees_affected' => $expiringTwoMonthsEmployees,
-                    'period' => 'Через 1-2 месяца',
-                    'color' => 'yellow',
-                    'icon' => '📅'
-                ]
-            ], 200);
-            
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to fetch dashboard summary',
-                'message' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-    /**
-     * POST /trainings/assign-to-position - Назначить курс всем сотрудникам должности
-     */
-    public function assignToPosition(Request $request)
-    {
-        try {
-            $validator = Validator::make($request->all(), [
-                'position_id' => 'required|exists:positions,id',
-                'course_id' => 'required|exists:courses,id',
-                'assigned_date' => 'nullable|date',
-                'expiration_date' => 'nullable|date|after:assigned_date',
-                'force' => 'nullable|boolean' // Принудительное обновление существующих
-            ]);
-            
-            if ($validator->fails()) {
-                return response()->json([
-                    'error' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
-            }
-            
-            DB::beginTransaction();
-            
-            // Получаем должность
-            $position = Position::findOrFail($request->position_id);
-            $course = Course::findOrFail($request->course_id);
-            
-            // Получаем всех сотрудников этой должности
-            $employees = Employee::where('position_id', $request->position_id)
-                ->where('status', 'active')
-                ->get();
-            
-            if ($employees->isEmpty()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Нет активных сотрудников с этой должностью'
-                ], 400);
-            }
-            
-            // Обработка дат
-            $assignedDate = $request->has('assigned_date') 
-                ? \Carbon\Carbon::parse($request->assigned_date) 
-                : now();
-            
-            $expirationDate = null;
-            if ($request->has('expiration_date')) {
-                $expirationDate = \Carbon\Carbon::parse($request->expiration_date);
-            } elseif ($course->periodicity_months) {
-                $expirationDate = $assignedDate->copy()->addMonths($course->periodicity_months);
-            }
-            
-            $force = $request->get('force', false);
-            $assigned = 0;
-            $updated = 0;
-            $skipped = 0;
-            $errors = [];
-            
-            foreach ($employees as $employee) {
-                try {
-                    // Проверяем существующее назначение
-                    $existing = EmployeeCourse::where('employee_id', $employee->id)
-                        ->where('course_id', $request->course_id)
-                        ->first();
-                    
-                    if ($existing) {
-                        if ($force) {
-                            // Обновляем существующее назначение
-                            $existing->assigned_date = $assignedDate;
-                            $existing->expiration_date = $expirationDate;
-                            $existing->status = 'active';
-                            $existing->save();
-                            $updated++;
-                        } else {
-                            $skipped++;
-                        }
-                        continue;
-                    }
-                    
-                    // Создаем новое назначение
-                    EmployeeCourse::create([
-                        'employee_id' => $employee->id,
-                        'course_id' => $request->course_id,
-                        'status' => 'required',
-                        'assigned_date' => $assignedDate,
-                        'expiration_date' => $expirationDate,
-                        'last_reminder_sent' => null
-                    ]);
-                    $assigned++;
-                    
-                } catch (\Exception $e) {
-                    $errors[] = [
-                        'employee_id' => $employee->id,
-                        'employee_name' => $employee->full_name,
-                        'error' => $e->getMessage()
-                    ];
-                }
-            }
-            
-            DB::commit();
-            
-            // Создаем требование в матрице компетенций
-            $requirement = PositionCourseRequirement::updateOrCreate(
-                [
-                    'position_id' => $request->position_id,
-                    'course_id' => $request->course_id
-                ],
-                [
-                    'is_required' => true
-                ]
-            );
-            
-            return response()->json([
-                'success' => true,
-                'message' => "Курс '{$course->name}' назначен должности '{$position->name}'",
-                'statistics' => [
-                    'position_id' => $position->id,
-                    'position_name' => $position->name,
-                    'course_id' => $course->id,
-                    'course_name' => $course->name,
-                    'total_employees' => $employees->count(),
-                    'assigned' => $assigned,
-                    'updated' => $updated,
-                    'skipped' => $skipped,
-                    'errors' => $errors
-                ],
-                'requirement_created' => true
-            ], 200);
-            
-        } catch (\Exception $e) {
-            DB::rollBack();
-            \Log::error('Assign to position error: ' . $e->getMessage());
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to assign course to position',
-                'error' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-    /**
-     * POST /trainings/assign-to-brigade - Назначить курс всем сотрудникам бригады
-     */
-    public function assignToBrigade(Request $request)
-    {
-        try {
-            $validator = Validator::make($request->all(), [
-                'brigade_id' => 'required|exists:brigades,id',
-                'course_id' => 'required|exists:courses,id',
-                'assigned_date' => 'nullable|date',
-                'expiration_date' => 'nullable|date|after:assigned_date',
-                'force' => 'nullable|boolean'
-            ]);
-            
-            if ($validator->fails()) {
-                return response()->json([
-                    'error' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
-            }
-            
-            DB::beginTransaction();
-            
-            $brigade = Brigade::findOrFail($request->brigade_id);
-            $course = Course::findOrFail($request->course_id);
-            
-            // Получаем всех сотрудников бригады
-            $employees = Employee::where('brigade_id', $request->brigade_id)
-                ->where('status', 'active')
-                ->get();
-            
-            if ($employees->isEmpty()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Нет активных сотрудников в этой бригаде'
-                ], 400);
-            }
-            
-            $assignedDate = $request->has('assigned_date') 
-                ? \Carbon\Carbon::parse($request->assigned_date) 
-                : now();
-            
-            $expirationDate = null;
-            if ($request->has('expiration_date')) {
-                $expirationDate = \Carbon\Carbon::parse($request->expiration_date);
-            } elseif ($course->periodicity_months) {
-                $expirationDate = $assignedDate->copy()->addMonths($course->periodicity_months);
-            }
-            
-            $force = $request->get('force', false);
-            $assigned = 0;
-            $updated = 0;
-            $skipped = 0;
-            $errors = [];
-            
-            foreach ($employees as $employee) {
-                try {
-                    $existing = EmployeeCourse::where('employee_id', $employee->id)
-                        ->where('course_id', $request->course_id)
-                        ->first();
-                    
-                    if ($existing) {
-                        if ($force) {
-                            $existing->assigned_date = $assignedDate;
-                            $existing->expiration_date = $expirationDate;
-                            $existing->status = 'active';
-                            $existing->save();
-                            $updated++;
-                        } else {
-                            $skipped++;
-                        }
-                        continue;
-                    }
-                    
-                    EmployeeCourse::create([
-                        'employee_id' => $employee->id,
-                        'course_id' => $request->course_id,
-                        'status' => 'required',
-                        'assigned_date' => $assignedDate,
-                        'expiration_date' => $expirationDate,
-                        'last_reminder_sent' => null
-                    ]);
-                    $assigned++;
-                    
-                } catch (\Exception $e) {
-                    $errors[] = [
-                        'employee_id' => $employee->id,
-                        'employee_name' => $employee->full_name,
-                        'error' => $e->getMessage()
-                    ];
-                }
-            }
-            
-            DB::commit();
-            
-            // Создаем требование в матрице для бригады
-            $requirement = BrigadeCourseRequirement::updateOrCreate(
-                [
-                    'brigade_id' => $request->brigade_id,
-                    'course_id' => $request->course_id
-                ],
-                [
-                    'is_required' => true
-                ]
-            );
-            
-            return response()->json([
-                'success' => true,
-                'message' => "Курс '{$course->name}' назначен бригаде '{$brigade->name}'",
-                'statistics' => [
-                    'brigade_id' => $brigade->id,
-                    'brigade_name' => $brigade->name,
-                    'course_id' => $course->id,
-                    'course_name' => $course->name,
-                    'total_employees' => $employees->count(),
-                    'assigned' => $assigned,
-                    'updated' => $updated,
-                    'skipped' => $skipped,
-                    'errors' => $errors
-                ],
-                'requirement_created' => true
-            ], 200);
-            
-        } catch (\Exception $e) {
-            DB::rollBack();
-            \Log::error('Assign to brigade error: ' . $e->getMessage());
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to assign course to brigade',
-                'error' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-    /**
-     * POST /trainings/assign-to-department - Назначить курс всем сотрудникам подразделения
-     */
-    public function assignToDepartment(Request $request)
-    {
-        try {
-            $validator = Validator::make($request->all(), [
-                'department_id' => 'required|exists:departments,id',
-                'course_id' => 'required|exists:courses,id',
-                'include_children' => 'nullable|boolean',
-                'assigned_date' => 'nullable|date',
-                'expiration_date' => 'nullable|date|after:assigned_date',
-                'force' => 'nullable|boolean'
-            ]);
-            
-            if ($validator->fails()) {
-                return response()->json([
-                    'error' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
-            }
-            
-            DB::beginTransaction();
-            
-            $department = \App\Models\Department::findOrFail($request->department_id);
-            $course = Course::findOrFail($request->course_id);
-            
-            // Получаем сотрудников подразделения
-            $employeeIds = \App\Models\Employee::where('department_id', $request->department_id)
-                ->where('status', 'active')
-                ->pluck('id')
-                ->toArray();
-            
-            // Включаем дочерние подразделения
-            $includeChildren = $request->get('include_children', false);
-            if ($includeChildren) {
-                $childIds = \App\Models\Department::where('parent_id', $request->department_id)
-                    ->pluck('id')
-                    ->toArray();
-                
-                $childEmployeeIds = \App\Models\Employee::whereIn('department_id', $childIds)
-                    ->where('status', 'active')
-                    ->pluck('id')
-                    ->toArray();
-                
-                $employeeIds = array_merge($employeeIds, $childEmployeeIds);
-            }
-            
-            $employees = Employee::whereIn('id', $employeeIds)->get();
-            
-            if ($employees->isEmpty()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Нет активных сотрудников в этом подразделении'
-                ], 400);
-            }
-            
-            $assignedDate = $request->has('assigned_date') 
-                ? \Carbon\Carbon::parse($request->assigned_date) 
-                : now();
-            
-            $expirationDate = null;
-            if ($request->has('expiration_date')) {
-                $expirationDate = \Carbon\Carbon::parse($request->expiration_date);
-            } elseif ($course->periodicity_months) {
-                $expirationDate = $assignedDate->copy()->addMonths($course->periodicity_months);
-            }
-            
-            $force = $request->get('force', false);
-            $assigned = 0;
-            $updated = 0;
-            $skipped = 0;
-            $errors = [];
-            
-            foreach ($employees as $employee) {
-                try {
-                    $existing = EmployeeCourse::where('employee_id', $employee->id)
-                        ->where('course_id', $request->course_id)
-                        ->first();
-                    
-                    if ($existing) {
-                        if ($force) {
-                            $existing->assigned_date = $assignedDate;
-                            $existing->expiration_date = $expirationDate;
-                            $existing->status = 'active';
-                            $existing->save();
-                            $updated++;
-                        } else {
-                            $skipped++;
-                        }
-                        continue;
-                    }
-                    
-                    EmployeeCourse::create([
-                        'employee_id' => $employee->id,
-                        'course_id' => $request->course_id,
-                        'status' => 'required',
-                        'assigned_date' => $assignedDate,
-                        'expiration_date' => $expirationDate,
-                        'last_reminder_sent' => null
-                    ]);
-                    $assigned++;
-                    
-                } catch (\Exception $e) {
-                    $errors[] = [
-                        'employee_id' => $employee->id,
-                        'employee_name' => $employee->full_name,
-                        'error' => $e->getMessage()
-                    ];
-                }
-            }
-            
-            DB::commit();
-            
-            return response()->json([
-                'success' => true,
-                'message' => "Курс '{$course->name}' назначен подразделению '{$department->name}'",
-                'statistics' => [
-                    'department_id' => $department->id,
-                    'department_name' => $department->name,
-                    'include_children' => $includeChildren,
-                    'course_id' => $course->id,
-                    'course_name' => $course->name,
-                    'total_employees' => $employees->count(),
-                    'assigned' => $assigned,
-                    'updated' => $updated,
-                    'skipped' => $skipped,
-                    'errors' => $errors
-                ]
-            ], 200);
-            
-        } catch (\Exception $e) {
-            DB::rollBack();
-            \Log::error('Assign to department error: ' . $e->getMessage());
-            return response()->json([
-                'success' => false,
-                'message' => 'Failed to assign course to department',
-                'error' => $e->getMessage()
-            ], 500);
+            return response()->json(['success' => false, 'message' => 'Failed to update regulatory acts', 'error' => $e->getMessage()], 500);
         }
     }
     
+    /**
+     * DELETE /trainings/{id} - Удаление обучения
+     */
+    public function destroy($id)
+    {
+        try {
+            $training = EmployeeCourse::findOrFail($id);
+            $employeeId = $training->employee_id;
+            $courseId = $training->course_id;
+            
+            $training->delete();
+            
+            // Очищаем кэш после удаления
+            $this->clearTrainingCache($employeeId, $courseId);
+            
+            return response()->json([
+                'success' => true,
+                'message' => 'Обучение удалено'
+            ], 200);
+            
+        } catch (ModelNotFoundException $e) {
+            return response()->json(['success' => false, 'message' => 'Training not found'], 404);
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'message' => 'Failed to delete training', 'error' => $e->getMessage()], 500);
+        }
+    }
+
+    /**
+     * Очистка кэша после изменений
+     */
+    private function clearTrainingCache($employeeId, $courseId = null)
+    {
+        // Очищаем общую статистику
+        Cache::forget('trainings_statistics');
+        Cache::forget('event_mapping');  // ← ВАЖНО: очищаем маппинг мероприятий
+        
+        // Очищаем кэш конкретного сотрудника
+        if ($employeeId) {
+            Cache::forget("employee_trainings_{$employeeId}");
+        }
+        
+        // Очищаем кэш деталей обучения
+        Cache::forget("training_details_*");
+        
+        // Очищаем кэш бригад
+        Cache::forget("brigade_trainings_*");
+        
+        // Очищаем кэш поиска
+        Cache::forget("trainings_search_*");
+        
+        // Очищаем кэш просроченных и истекающих
+        Cache::forget("trainings_expired_*");
+        Cache::forget("trainings_expiring_*");
+        Cache::forget("trainings_summary_*");
+    }
+    
+
+    /**
+     * Получить маппинг мероприятий (кэшированный)
+     */
+    private function getEventMapping()
+    {
+        // Уменьшаем время кэширования до 1 минуты для теста
+        return Cache::remember('event_mapping', now()->addMinutes(1), function() {
+            $mapping = [];
+            $events = TrainingEvent::with(['participants'])->get(['id', 'course_id', 'title', 'start_date', 'status']);
+            
+            foreach ($events as $event) {
+                foreach ($event->participants as $participant) {
+                    $mapping[$event->course_id][$participant->employee_id] = [
+                        'event_id' => $event->id,
+                        'event_title' => $event->title,
+                        'event_start_date' => $event->start_date->format('Y-m-d'),
+                        'event_status' => $event->status,
+                        'participant_status' => $participant->status
+                    ];
+                }
+            }
+            return $mapping;
+        });
+    }
     
     /**
-     * Получить историю обучения
+     * Группировка по курсам
      */
-    private function getTrainingHistory($training)
+    private function groupByCourse($items)
     {
-        $history = [];
-        
-        // Назначение
-        if ($training->assigned_date) {
-            $history[] = [
-                'action' => 'assigned',
-                'date' => $training->assigned_date->format('Y-m-d H:i:s'),
-                'user' => 'Система'
+        return collect($items)->groupBy('course_id')->map(function($items, $courseId) {
+            $first = $items->first();
+            return [
+                'course_id' => $courseId,
+                'course_name' => $first['course_name'],
+                'course_category' => $first['course_category'],
+                'count' => $items->count(),
+                'registered_count' => $items->where('registered_for_event', true)->count(),
+                'not_registered_count' => $items->where('registered_for_event', false)->count(),
+                'employees' => collect($items)->map(fn($i) => [
+                    'employee_id' => $i['employee_id'],
+                    'employee_name' => $i['employee_name'],
+                    'personnel_number' => $i['personnel_number'],
+                    'position' => $i['position'],
+                    'position_id' => $i['position_id'],
+                    'department' => $i['department'],
+                    'department_id' => $i['department_id'],
+                    'training_id' => $i['training_id'], // Добавлено поле training_id
+                    'days_left' => $i['days_left'] ?? null,
+                    'days_overdue' => $i['days_overdue'] ?? null,
+                    'expiration_date' => $i['expiration_date'],
+                    'registered_for_event' => $i['registered_for_event'],
+                    'event' => $i['event']
+                ])->values()->toArray()
             ];
-        }
+        })->values()->toArray();
+    }
+    /**
+     * Расчет статистики
+     */
+    private function calculateStatistics($allTrainings, $expired, $expiringMonth, $expiringTwoMonths)
+    {
+        return [
+            'total_trainings' => $allTrainings->count(),
+            'expired_total' => count($expired),
+            'expiring_month_total' => count($expiringMonth),
+            'expiring_two_months_total' => count($expiringTwoMonths),
+            'unique_employees_with_expired' => collect($expired)->unique('employee_id')->count(),
+            'unique_employees_expiring_month' => collect($expiringMonth)->unique('employee_id')->count(),
+            'unique_employees_expiring_two_months' => collect($expiringTwoMonths)->unique('employee_id')->count(),
+            'registered_for_events' => [
+                'expired' => collect($expired)->where('registered_for_event', true)->count(),
+                'expiring_month' => collect($expiringMonth)->where('registered_for_event', true)->count(),
+                'expiring_two_months' => collect($expiringTwoMonths)->where('registered_for_event', true)->count()
+            ]
+        ];
+    }
+    
+    /**
+     * Форматирование элемента обучения
+     */
+    private function formatTrainingItem($training, $employee, $course, $eventInfo, $daysLeft)
+    {
+        $fullName = trim(implode(' ', array_filter([$employee->last_name, $employee->first_name, $employee->middle_name])));
         
-        // Завершение
-        if ($training->completed_date) {
-            $history[] = [
-                'action' => 'completed',
-                'date' => $training->completed_date->format('Y-m-d H:i:s'),
-                'user' => 'Система'
-            ];
-        }
+        return [
+            'employee_id' => $employee->id,
+            'employee_name' => $fullName ?: $employee->full_name,
+            'personnel_number' => $employee->personnel_number,
+            'position' => $employee->position?->name ?? 'Не указана',
+            'position_id' => $employee->position_id,
+            'department' => $employee->department?->name ?? 'Не указано',
+            'department_id' => $employee->department_id,
+            'training_id' => $training->id, // ← Добавлено поле training_id
+            'course_id' => $course->id,
+            'course_name' => $course->name ?? 'Неизвестный курс',
+            'course_category' => $course->category?->name,
+            'assigned_date' => $training->assigned_date?->format('Y-m-d'),
+            'completed_date' => $training->completed_date?->format('Y-m-d'),
+            'expiration_date' => $training->expiration_date->format('Y-m-d'),
+            'days_left' => $daysLeft >= 0 ? (int)$daysLeft : 0, // ← Округление
+            'status' => $training->status,
+            'certificate_number' => $training->certificate_number,
+            'registered_for_event' => $eventInfo !== null,
+            'event' => $eventInfo
+        ];
+    }
         
-        // Продления (можно добавить из отдельной таблицы истории)
+        private function formatExpiredTraining($training)
+    {
+        $daysOverdue = now()->diffInDays($training->expiration_date, false);
         
-        // Отметки об отправке напоминаний
-        if ($training->last_reminder_sent) {
-            $history[] = [
-                'action' => 'reminder_sent',
-                'date' => $training->last_reminder_sent->format('Y-m-d H:i:s'),
-                'user' => 'Система'
-            ];
-        }
+        return [
+            'id' => $training->id,
+            'employeeName' => $training->employee->full_name,
+            'employeePosition' => $training->employee->position?->name ?? 'Не указана',
+            'employeeId' => $training->employee_id,
+            'trainingName' => $training->course?->name ?? 'Неизвестный курс',
+            'trainingId' => $training->course_id,
+            'expiredDate' => $training->expiration_date?->format('Y-m-d'),
+            'daysOverdue' => abs((int)$daysOverdue), // ← Добавлено приведение к int
+            'brigade' => $training->employee->brigade?->name ?? 'Не указана',
+            'brigadeId' => $training->employee->brigade_id,
+            'status' => $training->status
+        ];
+    }
+    
+    /**
+     * Форматирование истекающего обучения
+     */
+    private function formatExpiringTraining($training, $today)
+    {
+        $daysLeft = $today->diffInDays($training->expiration_date, false);
         
-        return $history;
+        return [
+            'id' => $training->id,
+            'employeeName' => $training->employee->full_name,
+            'employeePosition' => $training->employee->position?->name ?? 'Не указана',
+            'employeeId' => $training->employee_id,
+            'trainingName' => $training->course?->name ?? 'Неизвестный курс',
+            'trainingId' => $training->course_id,
+            'expiresDate' => $training->expiration_date?->format('Y-m-d'),
+            'daysLeft' => max(0, $daysLeft),
+            'brigade' => $training->employee->brigade?->name ?? 'Не указана',
+            'brigadeId' => $training->employee->brigade_id,
+            'status' => $this->getExpiryStatus($daysLeft)
+        ];
+    }
+    
+    /**
+     * Форматирование обучения сотрудника
+     */
+    private function formatEmployeeTraining($training)
+    {
+        return [
+            'id' => $training->id,
+            'name' => $training->course?->name ?? 'Неизвестный курс',
+            'courseId' => $training->course_id,
+            'status' => $training->status,
+            'assignedDate' => $training->assigned_date?->format('Y-m-d'),
+            'completedDate' => $training->completed_date?->format('Y-m-d'),
+            'expiresDate' => $training->expiration_date?->format('Y-m-d'),
+            'daysLeft' => $training->expiration_date ? now()->diffInDays($training->expiration_date, false) : null,
+            'certificateUrl' => $training->certificate_file_path,
+            'certificateNumber' => $training->certificate_number,
+            'regulatoryActs' => $training->regulatory_acts
+        ];
+    }
+    
+    /**
+     * Получить ключ кэша
+     */
+    private function getCacheKey($prefix, $request)
+    {
+        $params = array_merge(
+            $request->only(['brigade_id', 'department_id', 'position_id', 'employee_id', 'search']),
+            ['page' => $request->get('page', 1), 'limit' => $request->get('limit', 20)]
+        );
+        return "trainings_{$prefix}_" . md5(json_encode($params));
     }
     
     /**
@@ -2140,6 +1141,40 @@ class TrainingController extends Controller
         if ($daysLeft <= 30) return 'warning';
         return 'active';
     }
+    
+    /**
+     * Получить историю обучения
+     */
+    private function getTrainingHistory($training)
+    {
+        $history = [];
+        
+        if ($training->assigned_date) {
+            $history[] = [
+                'action' => 'assigned',
+                'date' => $training->assigned_date->format('Y-m-d H:i:s'),
+                'user' => 'Система'
+            ];
+        }
+        
+        if ($training->completed_date) {
+            $history[] = [
+                'action' => 'completed',
+                'date' => $training->completed_date->format('Y-m-d H:i:s'),
+                'user' => 'Система'
+            ];
+        }
+        
+        if ($training->last_reminder_sent) {
+            $history[] = [
+                'action' => 'reminder_sent',
+                'date' => $training->last_reminder_sent->format('Y-m-d H:i:s'),
+                'user' => 'Система'
+            ];
+        }
+        
+        return $history;
+    }
 
    /**
      * GET /trainings/employee-courses-summary - Курсы всех сотрудников по срокам
@@ -2147,263 +1182,103 @@ class TrainingController extends Controller
     public function getEmployeeCoursesSummary(Request $request)
     {
         try {
-            $today = now();
-            $monthEnd = $today->copy()->addDays(30);
-            $twoMonthsEnd = $today->copy()->addDays(60);
+            $cacheKey = $this->getCacheKey('summary', $request);
             
-            // Получаем все записи обучений
-            $query = EmployeeCourse::with(['employee', 'course']);
-            
-            // Фильтр по подразделению
-            if ($request->has('department_id')) {
-                $query->whereHas('employee', function($q) use ($request) {
-                    $q->where('department_id', $request->department_id);
-                });
-            }
-            
-            // Фильтр по должности
-            if ($request->has('position_id')) {
-                $query->whereHas('employee', function($q) use ($request) {
-                    $q->where('position_id', $request->position_id);
-                });
-            }
-            
-            // Фильтр по бригаде
-            if ($request->has('brigade_id')) {
-                $query->whereHas('employee', function($q) use ($request) {
-                    $q->where('brigade_id', $request->brigade_id);
-                });
-            }
-            
-            // Фильтр по сотруднику
-            if ($request->has('employee_id')) {
-                $query->where('employee_id', $request->employee_id);
-            }
-            
-            $allTrainings = $query->get();
-            
-            // Получаем все мероприятия и участников
-            $allEvents = TrainingEvent::with(['participants'])->get();
-            
-            // Создаем маппинг: course_id -> [employee_id => event_id]
-            $eventMapping = [];
-            foreach ($allEvents as $event) {
-                foreach ($event->participants as $participant) {
-                    $eventMapping[$event->course_id][$participant->employee_id] = [
-                        'event_id' => $event->id,
-                        'event_title' => $event->title,
-                        'event_start_date' => $event->start_date->format('Y-m-d'),
-                        'event_status' => $event->status,
-                        'participant_status' => $participant->status
-                    ];
-                }
-            }
-            
-            // Разделяем по категориям
-            $expired = [];
-            $expiringMonth = [];
-            $expiringTwoMonths = [];
-            $active = [];
-            
-            foreach ($allTrainings as $training) {
-                $employee = $training->employee;
-                $course = $training->course;
-                $expirationDate = $training->expiration_date;
+            $result = Cache::remember($cacheKey, now()->addMinutes($this->cacheTTL), function() use ($request) {
+                $today = now();
                 
-                if (!$expirationDate) {
-                    $active[] = $training;
-                    continue;
+                // Оптимизированный запрос с агрегацией
+                $query = EmployeeCourse::with([
+                    'employee:id,full_name,last_name,first_name,middle_name,personnel_number,position_id,department_id',
+                    'employee.position:id,name',
+                    'employee.department:id,name',
+                    'course:id,name,category_id',
+                    'course.category:id,name'
+                ])->select(['id', 'employee_id', 'course_id', 'status', 'assigned_date', 'completed_date', 'expiration_date', 'certificate_number']);
+                
+                if ($request->filled('department_id')) {
+                    $query->whereHas('employee', fn($q) => $q->where('department_id', $request->department_id));
+                }
+                if ($request->filled('position_id')) {
+                    $query->whereHas('employee', fn($q) => $q->where('position_id', $request->position_id));
+                }
+                if ($request->filled('brigade_id')) {
+                    $query->whereHas('employee', fn($q) => $q->where('brigade_id', $request->brigade_id));
+                }
+                if ($request->filled('employee_id')) {
+                    $query->where('employee_id', $request->employee_id);
                 }
                 
-                $daysLeft = $today->diffInDays($expirationDate, false);
+                $allTrainings = $query->get();
                 
-                // Проверяем, записан ли сотрудник на мероприятие по этому курсу
-                $eventInfo = $eventMapping[$course->id][$employee->id] ?? null;
+                // Получаем маппинг мероприятий
+                $eventMapping = $this->getEventMapping();
                 
-                $item = [
-                    'employee_id' => $employee->id,
-                    'employee_name' => $this->getEmployeeFullName($employee),
-                    'personnel_number' => $employee->personnel_number,
-                    'position' => $employee->position?->name ?? 'Не указана',
-                    'position_id' => $employee->position_id,  // Добавлено
-                    'department' => $employee->department?->name ?? 'Не указано',
-                    'department_id' => $employee->department_id,  // Добавлено
-                    'course_id' => $course->id,
-                    'course_name' => $course->name ?? 'Неизвестный курс',
-                    'course_category' => $course->category?->name,
-                    'training_id' => $training->id,
-                    'assigned_date' => $training->assigned_date?->format('Y-m-d'),
-                    'completed_date' => $training->completed_date?->format('Y-m-d'),
-                    'expiration_date' => $expirationDate->format('Y-m-d'),
-                    'days_left' => max(0, $daysLeft),
-                    'status' => $training->status,
-                    'certificate_number' => $training->certificate_number,
-                    'registered_for_event' => $eventInfo !== null,
-                    'event' => $eventInfo
-                ];
+                // Разделяем по категориям
+                $expired = [];
+                $expiringMonth = [];
+                $expiringTwoMonths = [];
                 
-                if ($daysLeft < 0) {
-                    $item['days_overdue'] = abs($daysLeft);
-                    $expired[] = $item;
-                } elseif ($daysLeft <= 30) {
-                    $expiringMonth[] = $item;
-                } elseif ($daysLeft <= 60) {
-                    $expiringTwoMonths[] = $item;
-                } else {
-                    $active[] = $item;
+                foreach ($allTrainings as $training) {
+                    $employee = $training->employee;
+                    $course = $training->course;
+                    $expirationDate = $training->expiration_date;
+                    
+                    if (!$expirationDate) continue;
+                    
+                    $daysLeft = $today->diffInDays($expirationDate, false);
+                    $eventInfo = $eventMapping[$course->id][$employee->id] ?? null;
+                    
+                    $item = $this->formatTrainingItem($training, $employee, $course, $eventInfo, $daysLeft);
+                    // Добавляем training_id в каждый элемент
+                    $item['training_id'] = $training->id;
+                    
+                    if ($daysLeft < 0) {
+                        $item['days_overdue'] = abs((int)$daysLeft);
+                        $expired[] = $item;
+                    } elseif ($daysLeft <= 30) {
+                        $expiringMonth[] = $item;
+                    } elseif ($daysLeft <= 60) {
+                        $expiringTwoMonths[] = $item;
+                    }
                 }
-            }
-            
-            // Группировка по курсам для просроченных с информацией о мероприятиях
-            $expiredByCourse = collect($expired)->groupBy('course_id')->map(function($items, $courseId) {
-                $first = $items->first();
+                
                 return [
-                    'course_id' => $courseId,
-                    'course_name' => $first['course_name'],
-                    'course_category' => $first['course_category'],
-                    'count' => $items->count(),
-                    'registered_count' => $items->where('registered_for_event', true)->count(),
-                    'not_registered_count' => $items->where('registered_for_event', false)->count(),
-                    'employees' => $items->map(fn($i) => [
-                        'employee_id' => $i['employee_id'],
-                        'employee_name' => $i['employee_name'],
-                        'personnel_number' => $i['personnel_number'],
-                        'position' => $i['position'],
-                        'position_id' => $i['position_id'],  // Добавлено
-                        'department' => $i['department'],
-                        'department_id' => $i['department_id'],  // Добавлено
-                        'days_overdue' => $i['days_overdue'],
-                        'expiration_date' => $i['expiration_date'],
-                        'registered_for_event' => $i['registered_for_event'],
-                        'event' => $i['event'] ? [
-                            'event_id' => $i['event']['event_id'],
-                            'event_title' => $i['event']['event_title'],
-                            'event_start_date' => $i['event']['event_start_date'],
-                            'participant_status' => $i['event']['participant_status']
-                        ] : null
-                    ])->values()
+                    'expired' => [
+                        'total' => count($expired),
+                        'by_course' => $this->groupByCourse($expired)
+                    ],
+                    'expiring_in_month' => [
+                        'total' => count($expiringMonth),
+                        'by_course' => $this->groupByCourse($expiringMonth)
+                    ],
+                    'expiring_in_two_months' => [
+                        'total' => count($expiringTwoMonths),
+                        'by_course' => $this->groupByCourse($expiringTwoMonths)
+                    ],
+                    'statistics' => $this->calculateStatistics($allTrainings, $expired, $expiringMonth, $expiringTwoMonths)
                 ];
-            })->values();
+            });
             
-            // Группировка по курсам для истекающих в месяц
-            $expiringMonthByCourse = collect($expiringMonth)->groupBy('course_id')->map(function($items, $courseId) {
-                $first = $items->first();
-                return [
-                    'course_id' => $courseId,
-                    'course_name' => $first['course_name'],
-                    'course_category' => $first['course_category'],
-                    'count' => $items->count(),
-                    'registered_count' => $items->where('registered_for_event', true)->count(),
-                    'not_registered_count' => $items->where('registered_for_event', false)->count(),
-                    'employees' => $items->map(fn($i) => [
-                        'employee_id' => $i['employee_id'],
-                        'employee_name' => $i['employee_name'],
-                        'personnel_number' => $i['personnel_number'],
-                        'position' => $i['position'],
-                        'department' => $i['department'],
-                        'days_left' => $i['days_left'],
-                        'expiration_date' => $i['expiration_date'],
-                        'registered_for_event' => $i['registered_for_event'],
-                        'event' => $i['event'] ? [
-                            'event_id' => $i['event']['event_id'],
-                            'event_title' => $i['event']['event_title'],
-                            'event_start_date' => $i['event']['event_start_date'],
-                            'participant_status' => $i['event']['participant_status']
-                        ] : null
-                    ])->values()
-                ];
-            })->values();
-            
-            // Группировка по курсам для истекающих от 1 до 2 месяцев
-            $expiringTwoMonthsByCourse = collect($expiringTwoMonths)->groupBy('course_id')->map(function($items, $courseId) {
-                $first = $items->first();
-                return [
-                    'course_id' => $courseId,
-                    'course_name' => $first['course_name'],
-                    'course_category' => $first['course_category'],
-                    'count' => $items->count(),
-                    'registered_count' => $items->where('registered_for_event', true)->count(),
-                    'not_registered_count' => $items->where('registered_for_event', false)->count(),
-                    'employees' => $items->map(fn($i) => [
-                        'employee_id' => $i['employee_id'],
-                        'employee_name' => $i['employee_name'],
-                        'personnel_number' => $i['personnel_number'],
-                        'position' => $i['position'],
-                        'department' => $i['department'],
-                        'days_left' => $i['days_left'],
-                        'expiration_date' => $i['expiration_date'],
-                        'registered_for_event' => $i['registered_for_event'],
-                        'event' => $i['event'] ? [
-                            'event_id' => $i['event']['event_id'],
-                            'event_title' => $i['event']['event_title'],
-                            'event_start_date' => $i['event']['event_start_date'],
-                            'participant_status' => $i['event']['participant_status']
-                        ] : null
-                    ])->values()
-                ];
-            })->values();
-            
-            // Общая статистика
-            $statistics = [
-                'total_trainings' => $allTrainings->count(),
-                'expired_total' => count($expired),
-                'expiring_month_total' => count($expiringMonth),
-                'expiring_two_months_total' => count($expiringTwoMonths),
-                'active_total' => count($active),
-                'unique_employees_with_expired' => collect($expired)->unique('employee_id')->count(),
-                'unique_employees_expiring_month' => collect($expiringMonth)->unique('employee_id')->count(),
-                'unique_employees_expiring_two_months' => collect($expiringTwoMonths)->unique('employee_id')->count(),
-                'registered_for_events' => [
-                    'expired' => collect($expired)->where('registered_for_event', true)->count(),
-                    'expiring_month' => collect($expiringMonth)->where('registered_for_event', true)->count(),
-                    'expiring_two_months' => collect($expiringTwoMonths)->where('registered_for_event', true)->count()
-                ]
-            ];
-            
-            return response()->json([
-                'expired' => [
-                    'total' => count($expired),
-                    'by_course' => $expiredByCourse,
-                    //'employees_list' => $expired
-                ],
-                'expiring_in_month' => [
-                    'total' => count($expiringMonth),
-                    'by_course' => $expiringMonthByCourse,
-                  //  'employees_list' => $expiringMonth
-                ],
-                'expiring_in_two_months' => [
-                    'total' => count($expiringTwoMonths),
-                    'by_course' => $expiringTwoMonthsByCourse,
-                  //  'employees_list' => $expiringTwoMonths
-                ],
-                'statistics' => $statistics
-            ], 200);
+            return response()->json($result, 200);
             
         } catch (\Exception $e) {
             \Log::error('Employee courses summary error: ' . $e->getMessage());
-            return response()->json([
-                'error' => 'Failed to fetch employee courses summary',
-                'message' => $e->getMessage()
-            ], 500);
+            return response()->json(['error' => 'Failed to fetch employee courses summary', 'message' => $e->getMessage()], 500);
         }
     }
 
     /**
-     * Получить полное имя сотрудника
+     * POST /training-events/clear-cache - Очистка кэша мероприятий
      */
-    private function getEmployeeFullName($employee)
+    public function clearCache()
     {
-        $fullName = trim(implode(' ', array_filter([
-            $employee->last_name,
-            $employee->first_name,
-            $employee->middle_name
-        ])));
+        Cache::forget('event_mapping');
+        Cache::forget('trainings_statistics');
         
-        if (empty($fullName)) {
-            $fullName = $employee->full_name;
-        }
-        
-        return $fullName;
+        return response()->json([
+            'success' => true,
+            'message' => 'Training events cache cleared'
+        ], 200);
     }
-    
 }

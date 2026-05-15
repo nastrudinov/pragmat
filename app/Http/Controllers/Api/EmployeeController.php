@@ -662,6 +662,121 @@ class EmployeeController extends Controller
     }
 
     /**
+     * GET /employees/compliance/selected - Данные о соответствии для указанных сотрудников
+     * 
+     * @param Request $request - содержит массив employee_ids
+     */
+    public function getComplianceForSelected(Request $request)
+    {
+         try {
+            $validator = Validator::make($request->all(), [
+                'employee_ids' => 'required|array|min:1',
+                'employee_ids.*' => 'exists:employees,id'
+            ]);
+            
+            if ($validator->fails()) {
+                return response()->json([
+                    'error' => 'Validation failed',
+                    'errors' => $validator->errors()
+                ], 422);
+            }
+            
+            $employeeIds = $request->employee_ids;
+            $total = count($employeeIds);
+            
+            // Соответствующие сотрудники (без просроченных обучений)
+            $compliant = Employee::whereIn('id', $employeeIds)
+                ->whereDoesntHave('employeeCourses', function($query) {
+                    $query->where('status', 'expired');
+                })
+                ->count();
+            
+            $nonCompliant = $total - $compliant;
+            $percentage = $total > 0 ? round(($compliant / $total) * 100) : 0;
+            
+            // Детальная информация по каждому сотруднику
+            $employees = Employee::with(['position', 'department', 'employeeCourses' => function($query) {
+                    $query->where('status', 'expired');
+                }])
+                ->whereIn('id', $employeeIds)
+                ->get()
+                ->map(function($employee) {
+                    $fullName = trim(implode(' ', array_filter([
+                        $employee->last_name,
+                        $employee->first_name,
+                        $employee->middle_name
+                    ])));
+                    
+                    $hasExpired = $employee->employeeCourses->where('status', 'expired')->count() > 0;
+                    $expiredCourses = $employee->employeeCourses->where('status', 'expired')->map(function($course) {
+                        return [
+                            'course_id' => $course->course_id,
+                            'course_name' => $course->course?->name,
+                            'expiration_date' => $course->expiration_date?->format('Y-m-d'),
+                            'days_overdue' => abs(now()->diffInDays($course->expiration_date, false))
+                        ];
+                    });
+                    
+                    return [
+                        'id' => $employee->id,
+                        'full_name' => $fullName ?: $employee->full_name,
+                        'personnel_number' => $employee->personnel_number,
+                        'position' => $employee->position?->name ?? 'Не указана',
+                        'department' => $employee->department?->name ?? 'Не указано',
+                        'is_compliant' => !$hasExpired,
+                        'expired_courses_count' => $expiredCourses->count(),
+                        'expired_courses' => $expiredCourses
+                    ];
+                });
+            
+            // Статистика по категориям курсов для указанных сотрудников
+            $categories = DB::table('course_categories')
+                ->leftJoin('courses', 'course_categories.id', '=', 'courses.category_id')
+                ->leftJoin('employee_courses', 'courses.id', '=', 'employee_courses.course_id')
+                ->whereIn('employee_courses.employee_id', $employeeIds)
+                ->select(
+                    'course_categories.name',
+                    DB::raw('COUNT(DISTINCT employee_courses.employee_id) as total_employees'),
+                    DB::raw('SUM(CASE WHEN employee_courses.status = "expired" THEN 1 ELSE 0 END) as non_compliant_count')
+                )
+                ->whereNotNull('employee_courses.employee_id')
+                ->groupBy('course_categories.id', 'course_categories.name')
+                ->get();
+            
+            $categoriesData = $categories->map(function($category) {
+                $totalEmployees = (int)$category->total_employees;
+                $nonCompliant = (int)$category->non_compliant_count;
+                $compliantCount = $totalEmployees - $nonCompliant;
+                $percentage = $totalEmployees > 0 
+                    ? round(($compliantCount / $totalEmployees) * 100) 
+                    : 0;
+                
+                return [
+                    'name' => $category->name,
+                    'count' => $totalEmployees,
+                    'percentage' => $percentage
+                ];
+            });
+            
+            return response()->json([
+                'total' => $total,
+                'compliant' => $compliant,
+                'nonCompliant' => $nonCompliant,
+                'compliancePercentage' => $percentage,
+                'employees' => $employees,
+                'categories' => $categoriesData
+            ], 200);
+            
+        } catch (\Exception $e) {
+            \Log::error('Compliance for selected error: ' . $e->getMessage());
+            return response()->json([
+                'error' => 'Failed to fetch compliance data for selected employees',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
      * GET /employees/{id}/courses - Получить курсы сотрудника с разбивкой по срокам
      */
     public function getEmployeeCourses($id, Request $request)

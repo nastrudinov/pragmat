@@ -7,13 +7,194 @@ use App\Models\TrainingEvent;
 use App\Models\TrainingEventParticipant;
 use App\Models\Course;
 use App\Models\Employee;
+use App\Models\EmployeeCourse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Carbon\Carbon;
 
 class TrainingEventController extends Controller
 {
+    /**
+     * Полная очистка всех кэшей, связанных с обучениями
+     */
+    private function clearAllRelatedCache()
+    {
+        // Очищаем кэш маппинга мероприятий
+        Cache::forget('event_mapping');
+        
+        // Очищаем кэш статистики обучений
+        Cache::forget('trainings_statistics');
+        
+        // Очищаем кэш summary (самый важный!)
+        $this->clearSummaryCache();
+        
+        // Очищаем кэш просроченных и истекающих
+        $keys = Cache::get('*');
+        if (is_array($keys)) {
+            foreach ($keys as $key => $value) {
+                if (str_starts_with($key, 'trainings_')) {
+                    Cache::forget($key);
+                }
+            }
+        }
+    }
+    
+    /**
+     * Очистка кэша summary по паттерну
+     */
+    private function clearSummaryCache()
+    {
+        // Удаляем все ключи, содержащие 'summary'
+        $keys = Cache::get('*');
+        if (is_array($keys)) {
+            foreach ($keys as $key => $value) {
+                if (str_contains($key, 'summary') || str_contains($key, 'trainings_summary')) {
+                    Cache::forget($key);
+                }
+            }
+        }
+        
+        // Также удаляем конкретные ключи
+        Cache::forget('trainings_summary_*');
+    }
+    
+    // ==================== МЕТОДЫ РАБОТЫ С УЧАСТНИКАМИ ====================
+    
+    /**
+     * POST /training-events/{id}/participants - Добавить участников
+     */
+    public function addParticipants(Request $request, $id)
+    {
+        try {
+            $event = TrainingEvent::findOrFail($id);
+            
+            $validator = Validator::make($request->all(), [
+                'employee_ids' => 'required|array|min:1',
+                'employee_ids.*' => 'exists:employees,id',
+                'status' => 'in:registered,confirmed'
+            ]);
+            
+            if ($validator->fails()) {
+                return response()->json([
+                    'error' => 'Validation failed',
+                    'errors' => $validator->errors()
+                ], 422);
+            }
+            
+            DB::beginTransaction();
+            
+            $added = 0;
+            $skipped = 0;
+            
+            foreach ($request->employee_ids as $employeeId) {
+                $exists = TrainingEventParticipant::where('event_id', $id)
+                    ->where('employee_id', $employeeId)
+                    ->exists();
+                
+                if (!$exists) {
+                    TrainingEventParticipant::create([
+                        'event_id' => $id,
+                        'employee_id' => $employeeId,
+                        'status' => $request->get('status', 'registered')
+                    ]);
+                    $added++;
+                } else {
+                    $skipped++;
+                }
+            }
+            
+            DB::commit();
+            
+            // ПОЛНАЯ ОЧИСТКА КЭША
+            $this->clearAllRelatedCache();
+            
+            return response()->json([
+                'success' => true,
+                'message' => "Добавлено {$added} участников. Пропущено: {$skipped}",
+                'added' => $added,
+                'skipped' => $skipped
+            ], 200);
+            
+        } catch (ModelNotFoundException $e) {
+            DB::rollBack();
+            return response()->json(['error' => 'Event not found'], 404);
+        } catch (\Exception $e) {
+            DB::rollBack();
+            \Log::error('Add participants error: ' . $e->getMessage());
+            return response()->json(['error' => 'Failed to add participants', 'message' => $e->getMessage()], 500);
+        }
+    }
+    
+    /**
+     * POST /training-events/{id}/participants/remove-bulk - Массовое удаление участников
+     */
+    public function removeParticipantsBulk(Request $request, $id)
+    {
+        try {
+            $event = TrainingEvent::findOrFail($id);
+            
+            $validator = Validator::make($request->all(), [
+                'participant_ids' => 'required|array|min:1',
+                'participant_ids.*' => 'exists:training_event_participants,id'
+            ]);
+            
+            if ($validator->fails()) {
+                return response()->json([
+                    'error' => 'Validation failed',
+                    'errors' => $validator->errors()
+                ], 422);
+            }
+            
+            $deleted = TrainingEventParticipant::where('event_id', $id)
+                ->whereIn('id', $request->participant_ids)
+                ->delete();
+            
+            // ПОЛНАЯ ОЧИСТКА КЭША
+            $this->clearAllRelatedCache();
+            
+            return response()->json([
+                'success' => true,
+                'message' => "Удалено {$deleted} участников",
+                'deleted_count' => $deleted
+            ], 200);
+            
+        } catch (ModelNotFoundException $e) {
+            return response()->json(['error' => 'Event not found'], 404);
+        } catch (\Exception $e) {
+            \Log::error('Remove participants bulk error: ' . $e->getMessage());
+            return response()->json(['error' => 'Failed to remove participants', 'message' => $e->getMessage()], 500);
+        }
+    }
+    
+    /**
+     * DELETE /training-events/{id}/participants/{participantId} - Удалить участника
+     */
+    public function removeParticipant($id, $participantId)
+    {
+        try {
+            $participant = TrainingEventParticipant::where('event_id', $id)
+                ->where('id', $participantId)
+                ->firstOrFail();
+            
+            $participant->delete();
+            
+            // ПОЛНАЯ ОЧИСТКА КЭША
+            $this->clearAllRelatedCache();
+            
+            return response()->json([
+                'success' => true,
+                'message' => 'Участник удален'
+            ], 200);
+            
+        } catch (ModelNotFoundException $e) {
+            return response()->json(['error' => 'Participant not found'], 404);
+        } catch (\Exception $e) {
+            return response()->json(['error' => 'Failed to remove participant', 'message' => $e->getMessage()], 500);
+        }
+    }
     /**
      * GET /training-events - Список мероприятий (для календаря)
      */
@@ -354,101 +535,14 @@ class TrainingEventController extends Controller
         }
     }
     
-    /**
-     * POST /training-events/{id}/participants - Добавить участников
-     */
-    public function addParticipants(Request $request, $id)
-    {
-        try {
-            $event = TrainingEvent::findOrFail($id);
-            
-            $validator = Validator::make($request->all(), [
-                'employee_ids' => 'required|array|min:1',
-                'employee_ids.*' => 'exists:employees,id',
-                'status' => 'in:registered,confirmed'
-            ]);
-            
-            if ($validator->fails()) {
-                return response()->json([
-                    'error' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
-            }
-            
-            $added = 0;
-            $skipped = 0;
-            
-            foreach ($request->employee_ids as $employeeId) {
-                $exists = TrainingEventParticipant::where('event_id', $id)
-                    ->where('employee_id', $employeeId)
-                    ->exists();
-                
-                if (!$exists) {
-                    TrainingEventParticipant::create([
-                        'event_id' => $id,
-                        'employee_id' => $employeeId,
-                        'status' => $request->get('status', 'registered')
-                    ]);
-                    $added++;
-                } else {
-                    $skipped++;
-                }
-            }
-            
-            return response()->json([
-                'success' => true,
-                'message' => "Добавлено {$added} участников. Пропущено: {$skipped}",
-                'added' => $added,
-                'skipped' => $skipped
-            ], 200);
-            
-        } catch (ModelNotFoundException $e) {
-            return response()->json([
-                'error' => 'Event not found'
-            ], 404);
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to add participants',
-                'message' => $e->getMessage()
-            ], 500);
-        }
-    }
-    
-    /**
-     * DELETE /training-events/{id}/participants/{participantId} - Удалить участника
-     */
-    public function removeParticipant($id, $participantId)
-    {
-        try {
-            $participant = TrainingEventParticipant::where('event_id', $id)
-                ->where('id', $participantId)
-                ->firstOrFail();
-            
-            $participant->delete();
-            
-            return response()->json([
-                'success' => true,
-                'message' => 'Участник удален'
-            ], 200);
-            
-        } catch (ModelNotFoundException $e) {
-            return response()->json([
-                'error' => 'Participant not found'
-            ], 404);
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to remove participant',
-                'message' => $e->getMessage()
-            ], 500);
-        }
-    }
-    
+       
     /**
      * PUT /training-events/{id}/participants/{participantId}/status - Обновить статус участника
      */
     public function updateParticipantStatus(Request $request, $id, $participantId)
     {
         try {
+            $event = TrainingEvent::findOrFail($id);
             $participant = TrainingEventParticipant::where('event_id', $id)
                 ->where('id', $participantId)
                 ->firstOrFail();
@@ -473,6 +567,9 @@ class TrainingEventController extends Controller
                 $this->updateEmployeeTraining($participant->employee_id, $event->course_id, $request->completion_date);
             }
             
+            // Очищаем кэш после обновления статуса
+            $this->clearEventCache();
+            
             return response()->json([
                 'success' => true,
                 'message' => 'Статус участника обновлен',
@@ -481,11 +578,43 @@ class TrainingEventController extends Controller
             
         } catch (ModelNotFoundException $e) {
             return response()->json([
-                'error' => 'Participant not found'
+                'error' => 'Event or participant not found'
+            ], 404);
+        } catch (\Exception $e) {
+            \Log::error('Update participant status error: ' . $e->getMessage());
+            return response()->json([
+                'error' => 'Failed to update participant status',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+    
+    /**
+     * DELETE /training-events/{id}/participants - Удалить всех участников
+     */
+    public function removeAllParticipants($id)
+    {
+        try {
+            $event = TrainingEvent::findOrFail($id);
+            
+            $deleted = TrainingEventParticipant::where('event_id', $id)->delete();
+            
+            // Очищаем кэш после удаления всех участников
+            $this->clearEventCache();
+            
+            return response()->json([
+                'success' => true,
+                'message' => "Удалены все участники ({$deleted})",
+                'deleted_count' => $deleted
+            ], 200);
+            
+        } catch (ModelNotFoundException $e) {
+            return response()->json([
+                'error' => 'Event not found'
             ], 404);
         } catch (\Exception $e) {
             return response()->json([
-                'error' => 'Failed to update participant status',
+                'error' => 'Failed to remove participants',
                 'message' => $e->getMessage()
             ], 500);
         }
@@ -503,7 +632,7 @@ class TrainingEventController extends Controller
         if ($training) {
             $course = Course::find($courseId);
             $periodicityMonths = $course?->periodicity_months ?? 12;
-            $newExpirationDate = \Carbon\Carbon::parse($completionDate)->addMonths($periodicityMonths);
+            $newExpirationDate = Carbon::parse($completionDate)->addMonths($periodicityMonths);
             
             $training->update([
                 'status' => 'active',
@@ -512,6 +641,7 @@ class TrainingEventController extends Controller
             ]);
         }
     }
+    
     
     private function getFormatLabel($format)
     {
