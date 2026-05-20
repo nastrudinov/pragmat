@@ -18,50 +18,57 @@ use Carbon\Carbon;
 class TrainingEventController extends Controller
 {
     /**
-     * Полная очистка всех кэшей, связанных с обучениями
+     * Принудительная очистка ВСЕГО кэша, связанного с обучениями
      */
-    private function clearAllRelatedCache()
+    private function clearAllTrainingCache()
     {
-        // Очищаем кэш маппинга мероприятий
+        // 1. Очищаем маппинг мероприятий
         Cache::forget('event_mapping');
         
-        // Очищаем кэш статистики обучений
+        // 2. Очищаем общую статистику
         Cache::forget('trainings_statistics');
         
-        // Очищаем кэш summary (самый важный!)
-        $this->clearSummaryCache();
+        // 3. Полностью очищаем ВСЕ ключи trainings_*
+        // Это самый надежный способ
+        $this->clearKeysByPrefix('trainings_');
         
-        // Очищаем кэш просроченных и истекающих
-        $keys = Cache::get('*');
-        if (is_array($keys)) {
-            foreach ($keys as $key => $value) {
-                if (str_starts_with($key, 'trainings_')) {
-                    Cache::forget($key);
-                }
-            }
-        }
+        // 4. Дополнительная очистка специфических ключей
+        Cache::forget('trainings_summary_*');
+        Cache::forget('trainings_expired_*');
+        Cache::forget('trainings_expiring_*');
+        
+        // 5. Очищаем кэш бригад (может содержать связанные данные)
+        Cache::forget('brigade_trainings_*');
+        
+        // 6. Очищаем кэш сотрудников
+        Cache::forget('employee_trainings_*');
+        
+        // 7. Очищаем кэш тепловой карты
+        Cache::forget('heatmap_*');
     }
     
     /**
-     * Очистка кэша summary по паттерну
+     * Очистка всех ключей по префиксу
      */
-    private function clearSummaryCache()
+    private function clearKeysByPrefix($prefix)
     {
-        // Удаляем все ключи, содержащие 'summary'
-        $keys = Cache::get('*');
-        if (is_array($keys)) {
-            foreach ($keys as $key => $value) {
-                if (str_contains($key, 'summary') || str_contains($key, 'trainings_summary')) {
-                    Cache::forget($key);
+        try {
+            // Для Redis драйвера
+            if (Cache::getStore() instanceof \Illuminate\Cache\RedisStore) {
+                $redis = Cache::getStore()->getRedis();
+                $keys = $redis->keys("*{$prefix}*");
+                foreach ($keys as $key) {
+                    $redis->del($key);
                 }
+            } else {
+                // Для file и database драйверов - очищаем весь кэш
+                Cache::flush();
             }
+        } catch (\Exception $e) {
+            // Если не получилось, очищаем всё
+            Cache::flush();
         }
-        
-        // Также удаляем конкретные ключи
-        Cache::forget('trainings_summary_*');
     }
-    
-    // ==================== МЕТОДЫ РАБОТЫ С УЧАСТНИКАМИ ====================
     
     /**
      * POST /training-events/{id}/participants - Добавить участников
@@ -108,8 +115,8 @@ class TrainingEventController extends Controller
             
             DB::commit();
             
-            // ПОЛНАЯ ОЧИСТКА КЭША
-            $this->clearAllRelatedCache();
+            // КРИТИЧНО: Очищаем ВЕСЬ кэш после изменения
+            $this->clearAllTrainingCache();
             
             return response()->json([
                 'success' => true,
@@ -152,8 +159,8 @@ class TrainingEventController extends Controller
                 ->whereIn('id', $request->participant_ids)
                 ->delete();
             
-            // ПОЛНАЯ ОЧИСТКА КЭША
-            $this->clearAllRelatedCache();
+            // КРИТИЧНО: Очищаем ВЕСЬ кэш после изменения
+            $this->clearAllTrainingCache();
             
             return response()->json([
                 'success' => true,
@@ -181,8 +188,8 @@ class TrainingEventController extends Controller
             
             $participant->delete();
             
-            // ПОЛНАЯ ОЧИСТКА КЭША
-            $this->clearAllRelatedCache();
+            // КРИТИЧНО: Очищаем ВЕСЬ кэш после изменения
+            $this->clearAllTrainingCache();
             
             return response()->json([
                 'success' => true,
@@ -195,6 +202,103 @@ class TrainingEventController extends Controller
             return response()->json(['error' => 'Failed to remove participant', 'message' => $e->getMessage()], 500);
         }
     }
+    
+    /**
+     * DELETE /training-events/{id}/participants - Удалить всех участников
+     */
+    public function removeAllParticipants($id)
+    {
+        try {
+            $event = TrainingEvent::findOrFail($id);
+            
+            $deleted = TrainingEventParticipant::where('event_id', $id)->delete();
+            
+            // КРИТИЧНО: Очищаем ВЕСЬ кэш после изменения
+            $this->clearAllTrainingCache();
+            
+            return response()->json([
+                'success' => true,
+                'message' => "Удалены все участники ({$deleted})",
+                'deleted_count' => $deleted
+            ], 200);
+            
+        } catch (ModelNotFoundException $e) {
+            return response()->json(['error' => 'Event not found'], 404);
+        } catch (\Exception $e) {
+            return response()->json(['error' => 'Failed to remove participants', 'message' => $e->getMessage()], 500);
+        }
+    }
+    
+    /**
+     * PUT /training-events/{id}/participants/{participantId}/status - Обновить статус участника
+     */
+    public function updateParticipantStatus(Request $request, $id, $participantId)
+    {
+        try {
+            $event = TrainingEvent::findOrFail($id);
+            $participant = TrainingEventParticipant::where('event_id', $id)
+                ->where('id', $participantId)
+                ->firstOrFail();
+            
+            $validator = Validator::make($request->all(), [
+                'status' => 'required|in:registered,confirmed,attended,absent,cancelled',
+                'completion_date' => 'nullable|date',
+                'certificate_number' => 'nullable|string|max:100'
+            ]);
+            
+            if ($validator->fails()) {
+                return response()->json([
+                    'error' => 'Validation failed',
+                    'errors' => $validator->errors()
+                ], 422);
+            }
+            
+            $participant->update($request->only(['status', 'completion_date', 'certificate_number']));
+            
+            // Если участник посетил мероприятие, обновляем его обучение
+            if ($request->status === 'attended' && $request->completion_date) {
+                $this->updateEmployeeTraining($participant->employee_id, $event->course_id, $request->completion_date);
+            }
+            
+            // КРИТИЧНО: Очищаем ВЕСЬ кэш после изменения
+            $this->clearAllTrainingCache();
+            
+            return response()->json([
+                'success' => true,
+                'message' => 'Статус участника обновлен',
+                'participant' => $participant
+            ], 200);
+            
+        } catch (ModelNotFoundException $e) {
+            return response()->json(['error' => 'Participant not found'], 404);
+        } catch (\Exception $e) {
+            \Log::error('Update participant status error: ' . $e->getMessage());
+            return response()->json(['error' => 'Failed to update participant status', 'message' => $e->getMessage()], 500);
+        }
+    }
+    
+    /**
+     * Обновить обучение сотрудника
+     */
+    private function updateEmployeeTraining($employeeId, $courseId, $completionDate)
+    {
+        $training = EmployeeCourse::where('employee_id', $employeeId)
+            ->where('course_id', $courseId)
+            ->first();
+        
+        if ($training) {
+            $course = Course::find($courseId);
+            $periodicityMonths = $course?->periodicity_months ?? 12;
+            $newExpirationDate = Carbon::parse($completionDate)->addMonths($periodicityMonths);
+            
+            $training->update([
+                'status' => 'active',
+                'completed_date' => $completionDate,
+                'expiration_date' => $newExpirationDate
+            ]);
+        }
+    }
+    
     /**
      * GET /training-events - Список мероприятий (для календаря)
      */
@@ -534,114 +638,7 @@ class TrainingEventController extends Controller
             ], 500);
         }
     }
-    
-       
-    /**
-     * PUT /training-events/{id}/participants/{participantId}/status - Обновить статус участника
-     */
-    public function updateParticipantStatus(Request $request, $id, $participantId)
-    {
-        try {
-            $event = TrainingEvent::findOrFail($id);
-            $participant = TrainingEventParticipant::where('event_id', $id)
-                ->where('id', $participantId)
-                ->firstOrFail();
-            
-            $validator = Validator::make($request->all(), [
-                'status' => 'required|in:registered,confirmed,attended,absent,cancelled',
-                'completion_date' => 'nullable|date',
-                'certificate_number' => 'nullable|string|max:100'
-            ]);
-            
-            if ($validator->fails()) {
-                return response()->json([
-                    'error' => 'Validation failed',
-                    'errors' => $validator->errors()
-                ], 422);
-            }
-            
-            $participant->update($request->only(['status', 'completion_date', 'certificate_number']));
-            
-            // Если участник посетил мероприятие, обновляем его обучение
-            if ($request->status === 'attended' && $request->completion_date) {
-                $this->updateEmployeeTraining($participant->employee_id, $event->course_id, $request->completion_date);
-            }
-            
-            // Очищаем кэш после обновления статуса
-            $this->clearEventCache();
-            
-            return response()->json([
-                'success' => true,
-                'message' => 'Статус участника обновлен',
-                'participant' => $participant
-            ], 200);
-            
-        } catch (ModelNotFoundException $e) {
-            return response()->json([
-                'error' => 'Event or participant not found'
-            ], 404);
-        } catch (\Exception $e) {
-            \Log::error('Update participant status error: ' . $e->getMessage());
-            return response()->json([
-                'error' => 'Failed to update participant status',
-                'message' => $e->getMessage()
-            ], 500);
-        }
-    }
-    
-    /**
-     * DELETE /training-events/{id}/participants - Удалить всех участников
-     */
-    public function removeAllParticipants($id)
-    {
-        try {
-            $event = TrainingEvent::findOrFail($id);
-            
-            $deleted = TrainingEventParticipant::where('event_id', $id)->delete();
-            
-            // Очищаем кэш после удаления всех участников
-            $this->clearEventCache();
-            
-            return response()->json([
-                'success' => true,
-                'message' => "Удалены все участники ({$deleted})",
-                'deleted_count' => $deleted
-            ], 200);
-            
-        } catch (ModelNotFoundException $e) {
-            return response()->json([
-                'error' => 'Event not found'
-            ], 404);
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to remove participants',
-                'message' => $e->getMessage()
-            ], 500);
-        }
-    }
-    
-    /**
-     * Обновить обучение сотрудника
-     */
-    private function updateEmployeeTraining($employeeId, $courseId, $completionDate)
-    {
-        $training = EmployeeCourse::where('employee_id', $employeeId)
-            ->where('course_id', $courseId)
-            ->first();
-        
-        if ($training) {
-            $course = Course::find($courseId);
-            $periodicityMonths = $course?->periodicity_months ?? 12;
-            $newExpirationDate = Carbon::parse($completionDate)->addMonths($periodicityMonths);
-            
-            $training->update([
-                'status' => 'active',
-                'completed_date' => $completionDate,
-                'expiration_date' => $newExpirationDate
-            ]);
-        }
-    }
-    
+   
     
     private function getFormatLabel($format)
     {

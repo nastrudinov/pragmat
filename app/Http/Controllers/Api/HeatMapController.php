@@ -8,6 +8,7 @@ use App\Models\Course;
 use App\Models\Brigade;
 use App\Models\Position;
 use App\Models\EmployeeCourse;
+use App\Models\Department;  
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Cache;
@@ -21,6 +22,7 @@ class HeatMapController extends Controller
     {
         $params = [
             'brigade_id' => $request->get('brigade_id'),
+            'department_id' => $request->get('department_id'),  // ДОБАВЛЕНО
             'position_id' => $request->get('position_id'),
             'status' => $request->get('status'),
             'search' => $request->get('search')
@@ -29,7 +31,7 @@ class HeatMapController extends Controller
         return "heatmap_{$prefix}_" . md5(json_encode($params));
     }
     
-    /**
+   /**
      * 3.1 GET /heatmap - Данные для тепловой карты
      */
     public function getHeatmapData(Request $request)
@@ -52,14 +54,24 @@ class HeatMapController extends Controller
                     ];
                 });
                 
-                // Оптимизированный запрос сотрудников с eager loading
+                // Оптимизированный запрос сотрудников с eager loading (добавлен department)
                 $query = Employee::query()
-                    ->with(['position:id,name', 'brigade:id,name', 'employeeCourses:id,employee_id,course_id,status,expiration_date,assigned_date,completed_date'])
-                    ->select(['id', 'full_name', 'position_id', 'brigade_id', 'status']);
+                    ->with([
+                        'position:id,name', 
+                        'brigade:id,name', 
+                        'department:id,name',  // ДОБАВЛЕНО
+                        'employeeCourses:id,employee_id,course_id,status,expiration_date,assigned_date,completed_date'
+                    ])
+                    ->select(['id', 'full_name', 'position_id', 'brigade_id', 'department_id', 'status']);  // ДОБАВЛЕН department_id
                 
                 // Применяем фильтры
                 if ($request->filled('brigade_id')) {
                     $query->where('brigade_id', $request->brigade_id);
+                }
+                
+                // Фильтр по подразделению (ДОБАВЛЕНО)
+                if ($request->filled('department_id')) {
+                    $query->where('department_id', $request->department_id);
                 }
                 
                 if ($request->filled('position_id')) {
@@ -80,6 +92,11 @@ class HeatMapController extends Controller
                 // Получаем все бригады для фильтров
                 $brigades = Cache::remember('heatmap_brigades', now()->addHours(24), function() {
                     return Brigade::orderBy('name')->pluck('name')->toArray();
+                });
+                
+                // Получаем все подразделения для фильтров (ДОБАВЛЕНО)
+                $departments = Cache::remember('heatmap_departments', now()->addHours(24), function() {
+                    return Department::orderBy('name')->pluck('name')->toArray();
                 });
                 
                 // Предварительная индексация обучений сотрудников
@@ -122,6 +139,8 @@ class HeatMapController extends Controller
                         'positionId' => $employee->position_id,
                         'brigade' => $this->sanitizeString($employee->brigade?->name ?? 'Не указана'),
                         'brigadeId' => $employee->brigade_id,
+                        'department' => $this->sanitizeString($employee->department?->name ?? 'Не указано'),  // ДОБАВЛЕНО
+                        'departmentId' => $employee->department_id,  // ДОБАВЛЕНО
                         'status' => $employee->status,
                         'trainings' => $trainingsStatus,
                         'overallStatus' => $overallStatus
@@ -132,6 +151,7 @@ class HeatMapController extends Controller
                     'employees' => $formattedEmployees,
                     'trainingTypes' => $trainingTypes,
                     'brigades' => $brigades,
+                    'departments' => $departments,  // ДОБАВЛЕНО
                     'totalEmployees' => $employees->count(),
                     'totalTrainings' => $courses->count()
                 ];
@@ -146,7 +166,7 @@ class HeatMapController extends Controller
             ], 500);
         }
     }
-    
+        
     /**
      * 3.2 GET /heatmap/employee/{employeeId} - Данные по сотруднику
      */
