@@ -16,6 +16,7 @@ use Illuminate\Support\Facades\Validator;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Schema;
 use Carbon\Carbon;
 
 class TrainingController extends Controller
@@ -1180,93 +1181,293 @@ class TrainingController extends Controller
      * GET /trainings/employee-courses-summary - Курсы всех сотрудников по срокам
      */
     public function getEmployeeCoursesSummary(Request $request)
-    {
-        try {
-            $cacheKey = $this->getCacheKey('summary', $request);
+{
+    try {
+        $cacheKey = $this->getCacheKey('summary', $request);
+        
+        $result = Cache::remember($cacheKey, now()->addMinutes($this->cacheTTL), function() use ($request) {
+            $today = now()->format('Y-m-d');
             
-            $result = Cache::remember($cacheKey, now()->addMinutes($this->cacheTTL), function() use ($request) {
-                $today = now();
+            // Строим условия WHERE для фильтрации
+            $whereConditions = [];
+            $bindings = [];
+            
+            if ($request->filled('department_id')) {
+                $whereConditions[] = "e.department_id = ?";
+                $bindings[] = $request->department_id;
+            }
+            if ($request->filled('position_id')) {
+                $whereConditions[] = "e.position_id = ?";
+                $bindings[] = $request->position_id;
+            }
+            if ($request->filled('brigade_id')) {
+                $whereConditions[] = "e.brigade_id = ?";
+                $bindings[] = $request->brigade_id;
+            }
+            if ($request->filled('employee_id')) {
+                $whereConditions[] = "ec.employee_id = ?";
+                $bindings[] = $request->employee_id;
+            }
+            
+            $whereClause = !empty($whereConditions) ? "AND " . implode(" AND ", $whereConditions) : "";
+            
+            // Исправляем название таблицы: employee_courses вместо employee_course
+            $sql = "
+                SELECT 
+                    ec.id as training_id,
+                    ec.employee_id,
+                    ec.course_id,
+                    ec.status,
+                    ec.assigned_date,
+                    ec.completed_date,
+                    ec.expiration_date,
+                    ec.certificate_number,
+                    e.id as employee_id,
+                    e.full_name,
+                    e.last_name,
+                    e.first_name,
+                    e.middle_name,
+                    e.personnel_number,
+                    e.position_id,
+                    e.department_id,
+                    e.brigade_id,
+                    p.name as position_name,
+                    d.name as department_name,
+                    c.name as course_name,
+                    c.category_id,
+                    cc.name as category_name,
+                    CASE 
+                        WHEN ec.expiration_date IS NULL THEN 'no_expiration'
+                        WHEN DATEDIFF(ec.expiration_date, CURDATE()) < 0 THEN 'expired'
+                        WHEN DATEDIFF(ec.expiration_date, CURDATE()) <= 30 THEN 'expiring_30'
+                        WHEN DATEDIFF(ec.expiration_date, CURDATE()) <= 60 THEN 'expiring_60'
+                        ELSE 'valid'
+                    END as expiry_status,
+                    DATEDIFF(ec.expiration_date, CURDATE()) as days_left
+                FROM employee_courses ec
+                INNER JOIN employees e ON ec.employee_id = e.id
+                LEFT JOIN positions p ON e.position_id = p.id
+                LEFT JOIN departments d ON e.department_id = d.id
+                INNER JOIN courses c ON ec.course_id = c.id
+                LEFT JOIN course_categories cc ON c.category_id = cc.id
+                WHERE ec.expiration_date IS NOT NULL
+                {$whereClause}
+                ORDER BY ec.expiration_date ASC
+            ";
+            
+            $allTrainings = DB::select($sql, $bindings);
+            
+            // Получаем маппинг мероприятий отдельно (если таблица events существует)
+            $eventMapping = $this->getEventMappingOptimized();
+            
+            $todayTimestamp = strtotime($today);
+            
+            // Разделяем по категориям
+            $expired = [];
+            $expiringMonth = [];
+            $expiringTwoMonths = [];
+            
+            foreach ($allTrainings as $training) {
+                $expirationDate = $training->expiration_date;
                 
-                // Оптимизированный запрос с агрегацией
-                $query = EmployeeCourse::with([
-                    'employee:id,full_name,last_name,first_name,middle_name,personnel_number,position_id,department_id',
-                    'employee.position:id,name',
-                    'employee.department:id,name',
-                    'course:id,name,category_id',
-                    'course.category:id,name'
-                ])->select(['id', 'employee_id', 'course_id', 'status', 'assigned_date', 'completed_date', 'expiration_date', 'certificate_number']);
+                if (!$expirationDate) continue;
                 
-                if ($request->filled('department_id')) {
-                    $query->whereHas('employee', fn($q) => $q->where('department_id', $request->department_id));
+                $expirationTimestamp = strtotime($expirationDate);
+                $daysLeft = (int)(($expirationTimestamp - $todayTimestamp) / 86400);
+                
+                $eventInfo = $eventMapping[$training->course_id][$training->employee_id] ?? null;
+                
+                $item = $this->formatTrainingItemOptimized($training, $eventInfo, $daysLeft);
+                
+                if ($daysLeft < 0) {
+                    $item['days_overdue'] = abs($daysLeft);
+                    $expired[] = $item;
+                } elseif ($daysLeft <= 30) {
+                    $expiringMonth[] = $item;
+                } elseif ($daysLeft <= 60) {
+                    $expiringTwoMonths[] = $item;
                 }
-                if ($request->filled('position_id')) {
-                    $query->whereHas('employee', fn($q) => $q->where('position_id', $request->position_id));
-                }
-                if ($request->filled('brigade_id')) {
-                    $query->whereHas('employee', fn($q) => $q->where('brigade_id', $request->brigade_id));
-                }
-                if ($request->filled('employee_id')) {
-                    $query->where('employee_id', $request->employee_id);
-                }
-                
-                $allTrainings = $query->get();
-                
-                // Получаем маппинг мероприятий
-                $eventMapping = $this->getEventMapping();
-                
-                // Разделяем по категориям
-                $expired = [];
-                $expiringMonth = [];
-                $expiringTwoMonths = [];
-                
-                foreach ($allTrainings as $training) {
-                    $employee = $training->employee;
-                    $course = $training->course;
-                    $expirationDate = $training->expiration_date;
-                    
-                    if (!$expirationDate) continue;
-                    
-                    $daysLeft = $today->diffInDays($expirationDate, false);
-                    $eventInfo = $eventMapping[$course->id][$employee->id] ?? null;
-                    
-                    $item = $this->formatTrainingItem($training, $employee, $course, $eventInfo, $daysLeft);
-                    // Добавляем training_id в каждый элемент
-                    $item['training_id'] = $training->id;
-                    
-                    if ($daysLeft < 0) {
-                        $item['days_overdue'] = abs((int)$daysLeft);
-                        $expired[] = $item;
-                    } elseif ($daysLeft <= 30) {
-                        $expiringMonth[] = $item;
-                    } elseif ($daysLeft <= 60) {
-                        $expiringTwoMonths[] = $item;
-                    }
-                }
-                
-                return [
-                    'expired' => [
-                        'total' => count($expired),
-                        'by_course' => $this->groupByCourse($expired)
-                    ],
-                    'expiring_in_month' => [
-                        'total' => count($expiringMonth),
-                        'by_course' => $this->groupByCourse($expiringMonth)
-                    ],
-                    'expiring_in_two_months' => [
-                        'total' => count($expiringTwoMonths),
-                        'by_course' => $this->groupByCourse($expiringTwoMonths)
-                    ],
-                    'statistics' => $this->calculateStatistics($allTrainings, $expired, $expiringMonth, $expiringTwoMonths)
+            }
+            
+            return [
+                'expired' => [
+                    'total' => count($expired),
+                    'by_course' => $this->groupByCourseOptimized($expired)
+                ],
+                'expiring_in_month' => [
+                    'total' => count($expiringMonth),
+                    'by_course' => $this->groupByCourseOptimized($expiringMonth)
+                ],
+                'expiring_in_two_months' => [
+                    'total' => count($expiringTwoMonths),
+                    'by_course' => $this->groupByCourseOptimized($expiringTwoMonths)
+                ],
+                'statistics' => $this->calculateStatisticsOptimized($allTrainings, count($expired), count($expiringMonth), count($expiringTwoMonths))
+            ];
+        });
+        
+        return response()->json($result, 200);
+        
+    } catch (\Exception $e) {
+        \Log::error('Employee courses summary error: ' . $e->getMessage());
+        return response()->json(['error' => 'Failed to fetch employee courses summary', 'message' => $e->getMessage()], 500);
+    }
+}
+
+private function getEventMappingOptimized(): array
+{
+    try {
+        // Проверяем существует ли таблица events
+        if (!Schema::hasTable('events')) {
+            return [];
+        }
+        
+        $events = DB::select("
+            SELECT 
+                course_id,
+                employee_id,
+                title,
+                start_date as start,
+                end_date as end,
+                format_date
+            FROM events
+            WHERE start_date >= CURDATE()
+            ORDER BY start_date ASC
+        ");
+        
+        $mapping = [];
+        foreach ($events as $event) {
+            $courseId = $event->course_id;
+            $employeeId = $event->employee_id;
+            
+            if (!isset($mapping[$courseId])) {
+                $mapping[$courseId] = [];
+            }
+            
+            // Пропускаем если employee_id null
+            if ($employeeId) {
+                $mapping[$courseId][$employeeId] = [
+                    'title' => $event->title,
+                    'start' => $event->start,
+                    'end' => $event->end,
+                    'format_date' => $event->format_date
                 ];
-            });
-            
-            return response()->json($result, 200);
-            
-        } catch (\Exception $e) {
-            \Log::error('Employee courses summary error: ' . $e->getMessage());
-            return response()->json(['error' => 'Failed to fetch employee courses summary', 'message' => $e->getMessage()], 500);
+            }
+        }
+        
+        return $mapping;
+    } catch (\Exception $e) {
+        \Log::warning('Failed to fetch event mapping: ' . $e->getMessage());
+        return [];
+    }
+}
+
+private function formatTrainingItemOptimized($training, ?array $eventInfo, int $daysLeft): array
+{
+    // Форматируем ФИО
+    $employeeName = $training->full_name;
+    if (!$employeeName) {
+        $parts = array_filter([
+            $training->last_name,
+            $training->first_name,
+            $training->middle_name
+        ]);
+        $employeeName = implode(' ', $parts);
+    }
+    
+    return [
+        'training_id' => $training->training_id,
+        'employee_id' => $training->employee_id,
+        'employee_name' => $employeeName,
+        'personnel_number' => $training->personnel_number,
+        'position' => $training->position_name,
+        'department' => $training->department_name,
+        'course_id' => $training->course_id,
+        'course_name' => $training->course_name,
+        'course_category' => $training->category_name,
+        'status' => $training->status,
+        'assigned_date' => $training->assigned_date,
+        'completed_date' => $training->completed_date,
+        'expiration_date' => $training->expiration_date,
+        'certificate_number' => $training->certificate_number,
+        'days_left' => $daysLeft,
+        'event' => $eventInfo
+    ];
+}
+
+private function groupByCourseOptimized(array $items): array
+{
+    $grouped = [];
+    
+    foreach ($items as $item) {
+        $courseId = $item['course_id'];
+        $courseName = $item['course_name'];
+        
+        if (!isset($grouped[$courseId])) {
+            $grouped[$courseId] = [
+                'course_id' => $courseId,
+                'course_name' => $courseName,
+                'count' => 0,
+                'employees' => []
+            ];
+        }
+        
+        $grouped[$courseId]['count']++;
+        $grouped[$courseId]['employees'][] = [
+            'employee_id' => $item['employee_id'],
+            'employee_name' => $item['employee_name'],
+            'personnel_number' => $item['personnel_number'],
+            'position' => $item['position'],
+            'department' => $item['department'],
+            'days_left' => $item['days_left'],
+            'expiration_date' => $item['expiration_date']
+        ];
+    }
+    
+    // Сортируем по количеству (сначала самые критичные)
+    uasort($grouped, fn($a, $b) => $b['count'] <=> $a['count']);
+    
+    return array_values($grouped);
+}
+
+private function calculateStatisticsOptimized($allTrainings, int $expiredCount, int $expiringMonthCount, int $expiringTwoMonthsCount): array
+{
+    $totalEmployees = DB::table('employees')->count();
+    $totalCourses = DB::table('courses')->count();
+    $totalTrainingsCount = count($allTrainings);
+    
+    // Статистика по статусам
+    $statusStats = [
+        'assigned' => 0,
+        'in_progress' => 0,
+        'completed' => 0,
+        'expired' => 0
+    ];
+    
+    foreach ($allTrainings as $training) {
+        $status = $training->status;
+        if (isset($statusStats[$status])) {
+            $statusStats[$status]++;
         }
     }
+    
+    // Уникальные сотрудники с просроченными обучениями
+    $uniqueEmployeesWithExpired = count(array_unique(array_column($allTrainings, 'employee_id')));
+    
+    return [
+        'total_employees' => $totalEmployees,
+        'total_courses' => $totalCourses,
+        'total_trainings' => $totalTrainingsCount,
+        'expired_count' => $expiredCount,
+        'expiring_in_month_count' => $expiringMonthCount,
+        'expiring_in_two_months_count' => $expiringTwoMonthsCount,
+        'employees_with_expired' => $uniqueEmployeesWithExpired,
+        'by_status' => $statusStats,
+        'completion_rate' => $totalTrainingsCount > 0 
+            ? round(($statusStats['completed'] / $totalTrainingsCount) * 100, 2)
+            : 0
+    ];
+}
 
     /**
      * POST /training-events/clear-cache - Очистка кэша мероприятий

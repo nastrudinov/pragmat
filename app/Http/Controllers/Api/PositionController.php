@@ -17,92 +17,148 @@ class PositionController extends Controller
      * 7.1 GET /positions - Список должностей с подразделениями
      */
     public function index(Request $request)
-    {
-        try {
-            $query = Position::with(['category', 'employees.department']);
-            
-            // Фильтр по категории
-            if ($request->has('category_id')) {
-                $query->where('category_id', $request->category_id);
-            }
-            
-            // Фильтр по подразделению (через сотрудников)
-            if ($request->has('department_id')) {
-                $query->whereHas('employees', function($q) use ($request) {
-                    $q->where('department_id', $request->department_id);
-                });
-            }
-            
-            // Поиск по названию
-            if ($request->has('search')) {
-                $search = $request->search;
-                $query->where('name', 'LIKE', "%{$search}%");
-            }
-            
-            // Сортировка
-            $sortField = $request->get('sort_by', 'name');
-            $sortDirection = $request->get('sort_direction', 'asc');
-            $query->orderBy($sortField, $sortDirection);
-            
-            $positions = $query->get();
-            
-            $formattedPositions = $positions->map(function($position) {
-                // Собираем уникальные подразделения, где есть сотрудники с этой должностью
-                $departments = $position->employees
-                    ->filter(function($employee) {
-                        return $employee->department !== null;
-                    })
-                    ->unique('department_id')
-                    ->map(function($employee) {
-                        return [
-                            'id' => $employee->department->id,
-                            'name' => $employee->department->name,
-                            'code' => $employee->department->code
-                        ];
-                    })
-                    ->values();
-                
-                // Общее количество сотрудников на этой должности
-                $employeesCount = $position->employees->count();
-                
-                // Количество сотрудников по подразделениям
-                $employeesByDepartment = $position->employees
-                    ->whereNotNull('department_id')
-                    ->groupBy('department_id')
-                    ->map(function($employees, $deptId) {
-                        $dept = $employees->first()->department;
-                        return [
-                            'department_id' => $deptId,
-                            'department_name' => $dept?->name ?? 'Без подразделения',
-                            'count' => $employees->count()
-                        ];
-                    })
-                    ->values();
-                
-                return [
-                    'id' => $position->id,
-                    'name' => $position->name,
-                    'category' => $position->category?->name ?? 'Без категории',
-                    'category_id' => $position->category_id,
-                    'departments' => $departments,  // Уникальные подразделения
-                    'employees_by_department' => $employeesByDepartment,  // Статистика по подразделениям
-                    'employees_count' => $employeesCount,
-                    'created_at' => $position->created_at?->toISOString(),
-                    'updated_at' => $position->updated_at?->toISOString()
-                ];
-            });
-            
-            return response()->json([
-                'positions' => $formattedPositions
-            ], 200);
-            
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to fetch positions',
-                'message' => $e->getMessage()
-            ], 500);
+{
+    try {
+        // Строим условия WHERE для фильтрации
+        $whereConditions = [];
+        $bindings = [];
+        
+        if ($request->has('category_id') && $request->category_id) {
+            $whereConditions[] = "p.category_id = ?";
+            $bindings[] = $request->category_id;
         }
+        
+        if ($request->has('search') && $request->search) {
+            $whereConditions[] = "p.name LIKE ?";
+            $bindings[] = "%{$request->search}%";
+        }
+        
+        $whereClause = !empty($whereConditions) ? "WHERE " . implode(" AND ", $whereConditions) : "";
+        
+        // Сортировка
+        $sortField = $request->get('sort_by', 'name');
+        $sortDirection = $request->get('sort_direction', 'asc');
+        
+        // Разрешенные поля для сортировки
+        $allowedSortFields = ['name', 'created_at', 'updated_at'];
+        if (!in_array($sortField, $allowedSortFields)) {
+            $sortField = 'name';
+        }
+        
+        $sortDirection = strtolower($sortDirection) === 'desc' ? 'DESC' : 'ASC';
+        
+        // Основной запрос для получения должностей с категориями
+        $sql = "
+            SELECT 
+                p.id,
+                p.name,
+                p.category_id,
+                p.created_at,
+                p.updated_at,
+                pc.name as category_name
+            FROM positions p
+            LEFT JOIN course_categories pc ON p.category_id = pc.id
+            {$whereClause}
+            ORDER BY p.{$sortField} {$sortDirection}
+        ";
+        
+        $positions = DB::select($sql, $bindings);
+        
+        if (empty($positions)) {
+            return response()->json(['positions' => []], 200);
+        }
+        
+        // Получаем ID всех должностей
+        $positionIds = array_column($positions, 'id');
+        $positionIdsPlaceholder = implode(',', array_fill(0, count($positionIds), '?'));
+        
+        // Запрос для получения сотрудников с группировкой по должностям и подразделениям
+        $employeesSql = "
+            SELECT 
+                e.position_id,
+                e.department_id,
+                d.id as department_id,
+                d.name as department_name,
+                d.code as department_code,
+                COUNT(e.id) as employees_count
+            FROM employees e
+            LEFT JOIN departments d ON e.department_id = d.id
+            WHERE e.position_id IN ({$positionIdsPlaceholder})
+            GROUP BY e.position_id, e.department_id, d.id, d.name, d.code
+            ORDER BY e.position_id, d.name
+        ";
+        
+        $employeesData = DB::select($employeesSql, $positionIds);
+        
+        // Группируем данные по должностям
+        $employeesByPosition = [];
+        foreach ($employeesData as $data) {
+            $positionId = $data->position_id;
+            if (!isset($employeesByPosition[$positionId])) {
+                $employeesByPosition[$positionId] = [
+                    'departments' => [],
+                    'employees_by_department' => [],
+                    'total_count' => 0
+                ];
+            }
+            
+            $departmentInfo = null;
+            if ($data->department_id) {
+                $departmentInfo = [
+                    'id' => $data->department_id,
+                    'name' => $data->department_name,
+                    'code' => $data->department_code
+                ];
+            }
+            
+            // Добавляем в уникальные подразделения
+            if ($departmentInfo && !isset($employeesByPosition[$positionId]['departments'][$data->department_id])) {
+                $employeesByPosition[$positionId]['departments'][$data->department_id] = $departmentInfo;
+            }
+            
+            // Добавляем статистику по подразделениям
+            $employeesByPosition[$positionId]['employees_by_department'][] = [
+                'department_id' => $data->department_id,
+                'department_name' => $data->department_name ?? 'Без подразделения',
+                'count' => (int)$data->employees_count
+            ];
+            
+            $employeesByPosition[$positionId]['total_count'] += (int)$data->employees_count;
+        }
+        
+        // Формируем ответ
+        $formattedPositions = [];
+        foreach ($positions as $position) {
+            $positionData = $employeesByPosition[$position->id] ?? [
+                'departments' => [],
+                'employees_by_department' => [],
+                'total_count' => 0
+            ];
+            
+            $formattedPositions[] = [
+                'id' => $position->id,
+                'name' => $position->name,
+                'category' => $position->category_name ?? 'Без категории',
+                'category_id' => $position->category_id,
+                'departments' => array_values($positionData['departments']),
+                'employees_by_department' => $positionData['employees_by_department'],
+                'employees_count' => $positionData['total_count'],
+                'created_at' => $position->created_at,
+                'updated_at' => $position->updated_at
+            ];
+        }
+        
+        return response()->json([
+            'positions' => $formattedPositions
+        ], 200);
+        
+    } catch (\Exception $e) {
+        return response()->json([
+            'error' => 'Failed to fetch positions',
+            'message' => $e->getMessage()
+        ], 500);
     }
+}
     
     /**
      * 7.2 GET /positions/categories - Категории должностей

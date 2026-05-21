@@ -16,106 +16,134 @@ use Illuminate\Support\Facades\DB;
 class EmployeeController extends Controller
 {
     /**
-     * 4.1 GET /employees - Список всех сотрудников (без пагинации)
-     */
-    public function index(Request $request)
-    {
-        try {
-            $query = Employee::with(['position', 'brigade', 'department'])
-                ->select('employees.*');
-            
-            // Фильтр по статусу
-            if ($request->has('status')) {
-                $query->where('employees.status', $request->status);
-            }
-            
-            // Фильтр по бригаде
-            if ($request->has('brigade_id')) {
-                $query->where('brigade_id', $request->brigade_id);
-            }
-            
-            // Фильтр по должности
-            if ($request->has('position_id')) {
-                $query->where('position_id', $request->position_id);
-            }
-            
-            // Фильтр по подразделению
-            if ($request->has('department_id')) {
-                $query->where('department_id', $request->department_id);
-            }
-            
-            // Поиск
-            if ($request->has('search')) {
-                $search = $request->search;
-                $query->where(function($q) use ($search) {
-                    $q->where('personnel_number', 'LIKE', "%{$search}%")
-                    ->orWhere('full_name', 'LIKE', "%{$search}%")
-                    ->orWhere('last_name', 'LIKE', "%{$search}%")
-                    ->orWhere('first_name', 'LIKE', "%{$search}%")
-                    ->orWhere('email', 'LIKE', "%{$search}%");
-                });
-            }
-            
-            // Сортировка по personnel_number (по умолчанию)
-            $sortField = $request->get('sort_by', 'personnel_number');
-            $sortDirection = $request->get('sort_direction', 'asc');
-            
-            // Разрешенные поля для сортировки
-            $allowedSortFields = ['personnel_number', 'full_name', 'last_name', 'created_at', 'status'];
-            if (!in_array($sortField, $allowedSortFields)) {
-                $sortField = 'personnel_number';
-            }
-            
-            $query->orderBy($sortField, $sortDirection);
-            
-            // Получаем всех сотрудников (без пагинации)
-            $employees = $query->get();
-            
-            $formattedEmployees = $employees->map(function($employee) {
-                // Формируем ФИО из трех полей
-                $fullName = trim(implode(' ', array_filter([
-                    $employee->last_name,
-                    $employee->first_name,
-                    $employee->middle_name
-                ])));
-                
-                // Если ФИО пустое, используем full_name из БД как запасной вариант
-                if (empty($fullName)) {
-                    $fullName = $employee->full_name;
-                }
-                
-                return [
-                    'id' => $employee->id,
-                    'personnel_number' => $employee->personnel_number,
-                    'full_name' => $fullName,
-                    'last_name' => $employee->last_name,
-                    'first_name' => $employee->first_name,
-                    'middle_name' => $employee->middle_name,
-                    'position' => $employee->position?->name ?? 'Не указана',
-                    'position_id' => $employee->position_id,
-                    'department' => $employee->department?->name ?? 'Не указано',
-                    'department_id' => $employee->department_id,
-                    'brigade' => $employee->brigade?->name ?? 'Не указана',
-                    'brigade_id' => $employee->brigade_id,
-                    'status' => $employee->status,
-                    'email' => $employee->email,
-                    'phone' => $employee->phone,
-                    'created_at' => $employee->created_at?->toISOString()
-                ];
-            });
-            
-            return response()->json([
-                'employees' => $formattedEmployees,
-                'total' => $employees->count()
-            ], 200);
-            
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to fetch employees',
-                'message' => $e->getMessage()
-            ], 500);
+ * 4.1 GET /employees - Список всех сотрудников (без пагинации)
+ */
+public function index(Request $request)
+{
+    try {
+        // Строим условия WHERE для фильтрации
+        $whereConditions = [];
+        $bindings = [];
+        
+        if ($request->has('status') && $request->status) {
+            $whereConditions[] = "e.status = ?";
+            $bindings[] = $request->status;
         }
+        
+        if ($request->has('brigade_id') && $request->brigade_id) {
+            $whereConditions[] = "e.brigade_id = ?";
+            $bindings[] = $request->brigade_id;
+        }
+        
+        if ($request->has('position_id') && $request->position_id) {
+            $whereConditions[] = "e.position_id = ?";
+            $bindings[] = $request->position_id;
+        }
+        
+        if ($request->has('department_id') && $request->department_id) {
+            $whereConditions[] = "e.department_id = ?";
+            $bindings[] = $request->department_id;
+        }
+        
+        // Поиск
+        if ($request->has('search') && $request->search) {
+            $search = $request->search;
+            $whereConditions[] = "(e.personnel_number LIKE ? OR e.full_name LIKE ? OR e.last_name LIKE ? OR e.first_name LIKE ? OR e.email LIKE ?)";
+            $bindings[] = "%{$search}%";
+            $bindings[] = "%{$search}%";
+            $bindings[] = "%{$search}%";
+            $bindings[] = "%{$search}%";
+            $bindings[] = "%{$search}%";
+        }
+        
+        $whereClause = !empty($whereConditions) ? "WHERE " . implode(" AND ", $whereConditions) : "";
+        
+        // Сортировка
+        $sortField = $request->get('sort_by', 'personnel_number');
+        $sortDirection = $request->get('sort_direction', 'asc');
+        
+        // Разрешенные поля для сортировки
+        $allowedSortFields = ['personnel_number', 'full_name', 'last_name', 'created_at', 'status'];
+        if (!in_array($sortField, $allowedSortFields)) {
+            $sortField = 'personnel_number';
+        }
+        
+        $sortDirection = strtolower($sortDirection) === 'desc' ? 'DESC' : 'ASC';
+        
+        // Основной SQL запрос
+        $sql = "
+            SELECT 
+                e.id,
+                e.personnel_number,
+                e.full_name,
+                e.last_name,
+                e.first_name,
+                e.middle_name,
+                e.position_id,
+                e.department_id,
+                e.brigade_id,
+                e.status,
+                e.email,
+                e.phone,
+                e.created_at,
+                p.name as position_name,
+                d.name as department_name,
+                b.name as brigade_name
+            FROM employees e
+            LEFT JOIN positions p ON e.position_id = p.id
+            LEFT JOIN departments d ON e.department_id = d.id
+            LEFT JOIN brigades b ON e.brigade_id = b.id
+            {$whereClause}
+            ORDER BY e.{$sortField} {$sortDirection}
+        ";
+        
+        $employees = DB::select($sql, $bindings);
+        
+        $formattedEmployees = array_map(function($employee) {
+            // Формируем ФИО из трех полей
+            $fullName = trim(implode(' ', array_filter([
+                $employee->last_name,
+                $employee->first_name,
+                $employee->middle_name
+            ])));
+            
+            // Если ФИО пустое, используем full_name из БД как запасной вариант
+            if (empty($fullName)) {
+                $fullName = $employee->full_name;
+            }
+            
+            return [
+                'id' => $employee->id,
+                'personnel_number' => $employee->personnel_number,
+                'full_name' => $fullName,
+                'last_name' => $employee->last_name,
+                'first_name' => $employee->first_name,
+                'middle_name' => $employee->middle_name,
+                'position' => $employee->position_name ?? 'Не указана',
+                'position_id' => $employee->position_id,
+                'department' => $employee->department_name ?? 'Не указано',
+                'department_id' => $employee->department_id,
+                'brigade' => $employee->brigade_name ?? 'Не указана',
+                'brigade_id' => $employee->brigade_id,
+                'status' => $employee->status,
+                'email' => $employee->email,
+                'phone' => $employee->phone,
+                'created_at' => $employee->created_at
+            ];
+        }, $employees);
+        
+        return response()->json([
+            'employees' => $formattedEmployees,
+            'total' => count($employees)
+        ], 200);
+        
+    } catch (\Exception $e) {
+        return response()->json([
+            'error' => 'Failed to fetch employees',
+            'message' => $e->getMessage()
+        ], 500);
     }
+}
     
     /**
      * 4.2 GET /employees/{id} - Детали сотрудника

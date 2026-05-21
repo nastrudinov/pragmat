@@ -25,61 +25,95 @@ class CourseController extends Controller
     public function index(Request $request)
     {
         try {
-            $query = Course::with('category');
+            // Строим условия WHERE для фильтрации
+            $whereConditions = [];
+            $bindings = [];
             
-            // Фильтр по категории
-            if ($request->has('category_id')) {
-                $query->where('category_id', $request->category_id);
+            if ($request->has('category_id') && $request->category_id) {
+                $whereConditions[] = "c.category_id = ?";
+                $bindings[] = $request->category_id;
             }
             
-            // Фильтр по подкатегории
-            if ($request->has('subcategory')) {
-                $query->where('subcategory', $request->subcategory);
+            if ($request->has('subcategory') && $request->subcategory) {
+                $whereConditions[] = "c.subcategory = ?";
+                $bindings[] = $request->subcategory;
             }
             
-            // Фильтр по типу
-            if ($request->has('type')) {
-                $query->where('type', $request->type);
+            if ($request->has('type') && $request->type) {
+                $whereConditions[] = "c.type = ?";
+                $bindings[] = $request->type;
             }
             
-            // Фильтр по направлению
-            if ($request->has('direction')) {
-                $query->where('direction', $request->direction);
+            if ($request->has('direction') && $request->direction) {
+                $whereConditions[] = "c.direction = ?";
+                $bindings[] = $request->direction;
             }
             
-            // Поиск по названию
-            if ($request->has('search')) {
+            // Поиск по названию, подкатегории или направлению
+            if ($request->has('search') && $request->search) {
                 $search = $request->search;
-                $query->where('name', 'LIKE', "%{$search}%")
-                    ->orWhere('subcategory', 'LIKE', "%{$search}%")
-                    ->orWhere('direction', 'LIKE', "%{$search}%");
+                $whereConditions[] = "(c.name LIKE ? OR c.subcategory LIKE ? OR c.direction LIKE ?)";
+                $bindings[] = "%{$search}%";
+                $bindings[] = "%{$search}%";
+                $bindings[] = "%{$search}%";
             }
+            
+            $whereClause = !empty($whereConditions) ? "WHERE " . implode(" AND ", $whereConditions) : "";
             
             // Сортировка
             $sortField = $request->get('sort_by', 'name');
             $sortDirection = $request->get('sort_direction', 'asc');
-            $query->orderBy($sortField, $sortDirection);
             
-            $courses = $query->get();
+            // Разрешенные поля для сортировки
+            $allowedSortFields = ['name', 'category_id', 'subcategory', 'type', 'direction', 'duration_hours', 'periodicity_months', 'created_at'];
+            if (!in_array($sortField, $allowedSortFields)) {
+                $sortField = 'name';
+            }
             
-            $formattedCourses = $courses->map(function($course) {
+            $sortDirection = strtolower($sortDirection) === 'desc' ? 'DESC' : 'ASC';
+            
+            // Основной SQL запрос
+            $sql = "
+                SELECT 
+                    c.id,
+                    c.name,
+                    c.category_id,
+                    c.subcategory,
+                    c.type,
+                    c.legal_basis,
+                    c.direction,
+                    c.duration_hours,
+                    c.periodicity_months,
+                    c.description,
+                    c.created_at,
+                    cc.name as category_name
+                FROM courses c
+                LEFT JOIN course_categories cc ON c.category_id = cc.id
+                {$whereClause}
+                ORDER BY c.{$sortField} {$sortDirection}
+            ";
+            
+            $courses = DB::select($sql, $bindings);
+            
+            // Форматируем результаты
+            $formattedCourses = array_map(function($course) {
                 return [
                     'id' => $course->id,
                     'name' => $course->name,
-                    'category' => $course->category?->name ?? 'Без категории',
+                    'category' => $course->category_name ?? 'Без категории',
                     'category_id' => $course->category_id,
-                    'subcategory' => $course->subcategory,      // Добавлено
-                    'type' => $course->type,                    // Добавлено
-                    'legal_basis' => $course->legal_basis,      // Добавлено
-                    'direction' => $course->direction,          // Добавлено
+                    'subcategory' => $course->subcategory,
+                    'type' => $course->type,
+                    'legal_basis' => $course->legal_basis,
+                    'direction' => $course->direction,
                     'duration' => $course->duration_hours ? $course->duration_hours . ' часов' : 'Не указано',
                     'duration_hours' => $course->duration_hours,
                     'periodicity' => $course->periodicity_months ? $course->periodicity_months . ' ' . $this->getPeriodicityText($course->periodicity_months) : 'Не указано',
                     'periodicity_months' => $course->periodicity_months,
                     'description' => $course->description,
-                    'created_at' => $course->created_at?->toISOString()
+                    'created_at' => $course->created_at
                 ];
-            });
+            }, $courses);
             
             return response()->json([
                 'courses' => $formattedCourses
@@ -92,7 +126,61 @@ class CourseController extends Controller
             ], 500);
         }
     }
-    
+
+    private function getPeriodicityText(int $months): string
+    {
+        $years = floor($months / 12);
+        $remainingMonths = $months % 12;
+        
+        if ($years > 0 && $remainingMonths > 0) {
+            return $years . ' ' . $this->getYearText($years) . ' ' . $remainingMonths . ' ' . $this->getMonthText($remainingMonths);
+        } elseif ($years > 0) {
+            return $years . ' ' . $this->getYearText($years);
+        } else {
+            return $months . ' ' . $this->getMonthText($months);
+        }
+    }
+
+    private function getYearText(int $years): string
+    {
+        $lastDigit = $years % 10;
+        $lastTwoDigits = $years % 100;
+        
+        if ($lastTwoDigits >= 11 && $lastTwoDigits <= 19) {
+            return 'лет';
+        }
+        
+        if ($lastDigit == 1) {
+            return 'год';
+        }
+        
+        if ($lastDigit >= 2 && $lastDigit <= 4) {
+            return 'года';
+        }
+        
+        return 'лет';
+    }
+
+    private function getMonthText(int $months): string
+    {
+        $lastDigit = $months % 10;
+        $lastTwoDigits = $months % 100;
+        
+        if ($lastTwoDigits >= 11 && $lastTwoDigits <= 19) {
+            return 'месяцев';
+        }
+        
+        if ($lastDigit == 1) {
+            return 'месяц';
+        }
+        
+        if ($lastDigit >= 2 && $lastDigit <= 4) {
+            return 'месяца';
+        }
+        
+        return 'месяцев';
+    }
+        
     /**
      * 6.2 GET /courses/categories - Категории курсов
      */
@@ -459,123 +547,157 @@ class CourseController extends Controller
      * 6.7 GET /matrix/positions - Матрица компетенций (должности)
      */
     public function getCompetenceMatrix()
-    {
-        try {
-            $positions = Position::with(['category'])->get();
-            $courses = Course::with('category')->orderBy('category_id')->orderBy('name')->get();
-            $brigades = Brigade::all();
-            
-            // Получаем требования по должностям
-            $positionRequirements = PositionCourseRequirement::all()
-                ->groupBy('position_id')
-                ->map(function($items) {
-                    $requiredIds = [];
-                    $optionalIds = [];
-                    foreach ($items as $item) {
-                        if ($item->is_required) {
-                            $requiredIds[] = $item->course_id;
-                        } else {
-                            $optionalIds[] = $item->course_id;
-                        }
-                    }
-                    return [
-                        'required' => $requiredIds,
-                        'optional' => $optionalIds
-                    ];
-                });
-            
-            // Получаем требования по бригадам
-            $brigadeRequirements = BrigadeCourseRequirement::all()
-                ->groupBy('brigade_id')
-                ->map(function($items) {
-                    return $items->pluck('course_id')->toArray();
-                });
-            
-            // Формируем матрицу для должностей
-            $positionsMatrix = $positions->map(function($position) use ($courses, $positionRequirements) {
-                $positionReqs = $positionRequirements[$position->id] ?? ['required' => [], 'optional' => []];
-                $requiredIds = $positionReqs['required'];
-                $optionalIds = $positionReqs['optional'];
-                
-                $coursesData = $courses->map(function($course) use ($requiredIds, $optionalIds) {
-                    $assigned = in_array($course->id, $requiredIds) || in_array($course->id, $optionalIds);
-                    $isRequired = in_array($course->id, $requiredIds);
-                    
-                    return [
-                        'courseId' => $course->id,
-                        'name' => $course->name,
-                        'category' => $course->category?->name,
-                        'subcategory' => $course->subcategory,
-                        'type' => $course->type,
-                        'direction' => $course->direction,
-                        'assigned' => $assigned,
-                        'isRequired' => $isRequired
-                    ];
-                });
-                
-                return [
-                    'id' => $position->id,
-                    'name' => $position->name,
-                    'category' => $position->category?->name ?? 'Без категории',
-                    'courses' => $coursesData,
-                    'requiredCount' => count($requiredIds),
-                    'totalCount' => $courses->count()
+{
+    try {
+        // Один запрос для получения всей матрицы должностей
+        $positionsMatrixRaw = DB::select("
+            SELECT 
+                p.id as position_id,
+                p.name as position_name,
+                pc.name as position_category,
+                c.id as course_id,
+                c.name as course_name,
+                cc.name as course_category,
+                c.subcategory,
+                c.type,
+                c.direction,
+                pcr.is_required,
+                CASE WHEN pcr.id IS NOT NULL THEN 1 ELSE 0 END as assigned
+            FROM positions p
+            LEFT JOIN course_categories pc ON p.category_id = pc.id
+            CROSS JOIN courses c
+            LEFT JOIN course_categories cc ON c.category_id = cc.id
+            LEFT JOIN position_course_requirements pcr ON pcr.position_id = p.id AND pcr.course_id = c.id
+            WHERE pcr.id IS NOT NULL OR pcr.is_required = 1
+            ORDER BY p.id, c.category_id, c.name
+        ");
+        
+        // Группируем результат по должностям
+        $positionsMatrix = collect();
+        $currentPosition = null;
+        $positionData = [];
+        
+        foreach ($positionsMatrixRaw as $row) {
+            if ($currentPosition !== $row->position_id) {
+                if ($currentPosition !== null) {
+                    $positionsMatrix->push($positionData);
+                }
+                $currentPosition = $row->position_id;
+                $positionData = [
+                    'id' => $row->position_id,
+                    'name' => $row->position_name,
+                    'category' => $row->position_category ?? 'Без категории',
+                    'courses' => [],
+                    'requiredCount' => 0,
+                    'totalCount' => 0
                 ];
-            });
+            }
             
-            // Формируем матрицу для бригад
-            $brigadesMatrix = $brigades->map(function($brigade) use ($courses, $brigadeRequirements) {
-                $requiredIds = $brigadeRequirements[$brigade->id] ?? [];
-                
-                $coursesData = $courses->map(function($course) use ($requiredIds) {
-                    return [
-                        'courseId' => $course->id,
-                        'name' => $course->name,
-                        'category' => $course->category?->name,
-                        'subcategory' => $course->subcategory,
-                        'type' => $course->type,
-                        'direction' => $course->direction,
-                        'assigned' => in_array($course->id, $requiredIds)
-                    ];
-                });
-                
-                return [
-                    'id' => $brigade->id,
-                    'name' => $brigade->name,
-                    'courses' => $coursesData,
-                    'requiredCount' => count($requiredIds)
-                ];
-            });
+            $isRequired = (bool)$row->is_required;
+            if ($isRequired) {
+                $positionData['requiredCount']++;
+            }
             
-            return response()->json([
-                'positions' => $positionsMatrix,
-                'brigades' => $brigadesMatrix,
-                'courses' => $courses->map(function($course) {
-                    return [
-                        'id' => $course->id,
-                        'name' => $course->name,
-                        'category' => $course->category?->name,
-                        'categoryId' => $course->category_id,
-                        'subcategory' => $course->subcategory,
-                        'type' => $course->type,
-                        'direction' => $course->direction
-                    ];
-                }),
-                'categories' => CourseCategory::orderBy('sort_order')->get(),
-                'summary' => [
-                    'totalPositions' => $positions->count(),
-                    'totalBrigades' => $brigades->count(),
-                    'totalCourses' => $courses->count()
-                ]
-            ], 200);
-            
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to fetch competence matrix',
-                'message' => $e->getMessage()
-            ], 500);
+            $positionData['courses'][] = [
+                'courseId' => $row->course_id,
+                'name' => $row->course_name,
+                'category' => $row->course_category,
+                'subcategory' => $row->subcategory,
+                'type' => $row->type,
+                'direction' => $row->direction,
+                'assigned' => (bool)$row->assigned,
+                'isRequired' => $isRequired
+            ];
+            $positionData['totalCount']++;
         }
+        
+        if ($currentPosition !== null) {
+            $positionsMatrix->push($positionData);
+        }
+        
+        // Запрос для бригад
+        $brigadesMatrixRaw = DB::select("
+            SELECT 
+                b.id as brigade_id,
+                b.name as brigade_name,
+                c.id as course_id,
+                c.name as course_name,
+                cc.name as course_category,
+                c.subcategory,
+                c.type,
+                c.direction
+            FROM brigades b
+            CROSS JOIN courses c
+            LEFT JOIN course_categories cc ON c.category_id = cc.id
+            INNER JOIN brigade_course_requirements bcr ON bcr.brigade_id = b.id AND bcr.course_id = c.id
+            ORDER BY b.id, c.category_id, c.name
+        ");
+        
+        $brigadesMatrix = collect();
+        $currentBrigade = null;
+        $brigadeData = [];
+        
+        foreach ($brigadesMatrixRaw as $row) {
+            if ($currentBrigade !== $row->brigade_id) {
+                if ($currentBrigade !== null) {
+                    $brigadesMatrix->push($brigadeData);
+                }
+                $currentBrigade = $row->brigade_id;
+                $brigadeData = [
+                    'id' => $row->brigade_id,
+                    'name' => $row->brigade_name,
+                    'courses' => [],
+                    'requiredCount' => 0
+                ];
+            }
+            
+            $brigadeData['courses'][] = [
+                'courseId' => $row->course_id,
+                'name' => $row->course_name,
+                'category' => $row->course_category,
+                'subcategory' => $row->subcategory,
+                'type' => $row->type,
+                'direction' => $row->direction,
+                'assigned' => true
+            ];
+            $brigadeData['requiredCount']++;
+        }
+        
+        if ($currentBrigade !== null) {
+            $brigadesMatrix->push($brigadeData);
+        }
+        
+        // Получаем курсы и категории
+        $courses = DB::table('courses')
+            ->leftJoin('course_categories', 'courses.category_id', '=', 'course_categories.id')
+            ->select('courses.*', 'course_categories.name as category_name')
+            ->orderBy('courses.category_id')
+            ->orderBy('courses.name')
+            ->get();
+        
+        $categories = DB::table('course_categories')
+            ->orderBy('sort_order')
+            ->get();
+        
+        return response()->json([
+            'positions' => $positionsMatrix,
+            'brigades' => $brigadesMatrix,
+            'courses' => $courses,
+            'categories' => $categories,
+            'summary' => [
+                'totalPositions' => DB::table('positions')->count(),
+                'totalBrigades' => DB::table('brigades')->count(),
+                'totalCourses' => DB::table('courses')->count()
+            ]
+        ], 200);
+        
+    } catch (\Exception $e) {
+        return response()->json([
+            'error' => 'Failed to fetch competence matrix',
+            'message' => $e->getMessage()
+        ], 500);
     }
+}
     
     /**
      * 6.8 PUT /matrix/positions/{positionId}/courses/{courseId} - Назначить/отменить курс для должности
@@ -808,21 +930,6 @@ class CourseController extends Controller
         }
     }
     
-    /**
-     * Получить текст периодичности
-     */
-    private function getPeriodicityText($months)
-    {
-        if ($months == 12) {
-            return 'год';
-        } elseif ($months == 6) {
-            return 'месяцев';
-        } elseif ($months == 24) {
-            return 'года';
-        } else {
-            return 'мес.';
-        }
-    }
 
     /**
      * GET /courses/{courseId}/employees - Получить сотрудников, привязанных к курсу

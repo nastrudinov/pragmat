@@ -19,153 +19,187 @@ class HeatMapController extends Controller
      * Ключ для кэша тепловой карты
      */
     private function getCacheKey($prefix, $request)
-    {
-        $params = [
-            'brigade_id' => $request->get('brigade_id'),
-            'department_id' => $request->get('department_id'),  // ДОБАВЛЕНО
-            'position_id' => $request->get('position_id'),
-            'status' => $request->get('status'),
-            'search' => $request->get('search')
-        ];
-        
-        return "heatmap_{$prefix}_" . md5(json_encode($params));
-    }
+{
+    $params = [
+        'brigade_id' => $request->get('brigade_id'),
+        'department_id' => $request->get('department_id'),
+        'position_id' => $request->get('position_id'),
+        'status' => $request->get('status'),
+        'search' => $request->get('search')
+    ];
+    
+    return "heatmap_{$prefix}_" . md5(json_encode($params));
+}
     
    /**
-     * 3.1 GET /heatmap - Данные для тепловой карты
-     */
-    public function getHeatmapData(Request $request)
-    {
-        try {
-            $cacheKey = $this->getCacheKey('data', $request);
-            $cacheTTL = now()->addMinutes(15);
+ * 3.1 GET /heatmap - Данные для тепловой карты
+ */
+/**
+ * 3.1 GET /heatmap - Данные для тепловой карты
+ */
+public function getHeatmapData(Request $request)
+{
+    try {
+        $cacheKey = $this->getCacheKey('data', $request);
+        $cacheTTL = now()->addMinutes(15);
+        
+        $result = Cache::remember($cacheKey, $cacheTTL, function() use ($request) {
+            // Получаем все курсы
+            $courses = $this->getCachedCourses();
             
-            $result = Cache::remember($cacheKey, $cacheTTL, function() use ($request) {
-                // Получаем все курсы один раз с кэшированием
-                $courses = $this->getCachedCourses();
-                
-                $trainingTypes = $courses->map(function($course) {
-                    return [
-                        'id' => 'course_' . $course->id,
-                        'name' => $course->name,
-                        'shortName' => $this->getSafeShortName($course->name),
-                        'category' => $course->category?->name ?? 'Без категории',
-                        'categoryId' => $course->category_id
-                    ];
-                });
-                
-                // Оптимизированный запрос сотрудников с eager loading (добавлен department)
-                $query = Employee::query()
-                    ->with([
-                        'position:id,name', 
-                        'brigade:id,name', 
-                        'department:id,name',  // ДОБАВЛЕНО
-                        'employeeCourses:id,employee_id,course_id,status,expiration_date,assigned_date,completed_date'
-                    ])
-                    ->select(['id', 'full_name', 'position_id', 'brigade_id', 'department_id', 'status']);  // ДОБАВЛЕН department_id
-                
-                // Применяем фильтры
-                if ($request->filled('brigade_id')) {
-                    $query->where('brigade_id', $request->brigade_id);
-                }
-                
-                // Фильтр по подразделению (ДОБАВЛЕНО)
-                if ($request->filled('department_id')) {
-                    $query->where('department_id', $request->department_id);
-                }
-                
-                if ($request->filled('position_id')) {
-                    $query->where('position_id', $request->position_id);
-                }
-                
-                if ($request->filled('status')) {
-                    $query->where('status', $request->status);
-                }
-                
-                if ($request->filled('search')) {
-                    $search = $request->search;
-                    $query->where('full_name', 'LIKE', "%{$search}%");
-                }
-                
-                $employees = $query->get();
-                
-                // Получаем все бригады для фильтров
-                $brigades = Cache::remember('heatmap_brigades', now()->addHours(24), function() {
-                    return Brigade::orderBy('name')->pluck('name')->toArray();
-                });
-                
-                // Получаем все подразделения для фильтров (ДОБАВЛЕНО)
-                $departments = Cache::remember('heatmap_departments', now()->addHours(24), function() {
-                    return Department::orderBy('name')->pluck('name')->toArray();
-                });
-                
-                // Предварительная индексация обучений сотрудников
-                $employeeCoursesMap = [];
-                foreach ($employees as $employee) {
-                    $employeeCoursesMap[$employee->id] = $employee->employeeCourses->keyBy('course_id');
-                }
-                
-                $formattedEmployees = [];
-                foreach ($employees as $employee) {
-                    $trainingsStatus = [];
-                    $overallStatus = 'active';
-                    
-                    foreach ($courses as $course) {
-                        $employeeCourse = $employeeCoursesMap[$employee->id][$course->id] ?? null;
-                        
-                        if (!$employeeCourse) {
-                            $status = 'noData';
-                        } else {
-                            $status = $employeeCourse->status;
-                            
-                            if ($status === 'expired') {
-                                $overallStatus = 'expired';
-                            } elseif ($status === 'expiring' && $overallStatus !== 'expired') {
-                                $overallStatus = 'expiring';
-                            } elseif ($status === 'required' && $overallStatus !== 'expired' && $overallStatus !== 'expiring') {
-                                $overallStatus = 'required';
-                            }
-                        }
-                        
-                        $trainingsStatus['course_' . $course->id] = $status;
-                    }
-                    
-                    $trainingsStatus['_overall'] = $overallStatus;
-                    
-                    $formattedEmployees[] = [
-                        'id' => $employee->id,
-                        'name' => $this->sanitizeString($employee->full_name),
-                        'position' => $this->sanitizeString($employee->position?->name ?? 'Не указана'),
-                        'positionId' => $employee->position_id,
-                        'brigade' => $this->sanitizeString($employee->brigade?->name ?? 'Не указана'),
-                        'brigadeId' => $employee->brigade_id,
-                        'department' => $this->sanitizeString($employee->department?->name ?? 'Не указано'),  // ДОБАВЛЕНО
-                        'departmentId' => $employee->department_id,  // ДОБАВЛЕНО
-                        'status' => $employee->status,
-                        'trainings' => $trainingsStatus,
-                        'overallStatus' => $overallStatus
-                    ];
-                }
-                
+            $trainingTypes = $courses->map(function($course) {
                 return [
-                    'employees' => $formattedEmployees,
-                    'trainingTypes' => $trainingTypes,
-                    'brigades' => $brigades,
-                    'departments' => $departments,  // ДОБАВЛЕНО
-                    'totalEmployees' => $employees->count(),
-                    'totalTrainings' => $courses->count()
+                    'id' => 'course_' . $course->id,
+                    'name' => $course->name,
+                    'shortName' => $this->getSafeShortName($course->name),
+                    'category' => $course->category?->name ?? 'Без категории',
+                    'categoryId' => $course->category_id
                 ];
             });
             
-            return response()->json($result)->setEncodingOptions(JSON_UNESCAPED_UNICODE);
+            // Строим сырой SQL запрос (УБРАЛИ e.deleted_at)
+            $employeeQuery = "
+                SELECT 
+                    e.id,
+                    e.full_name,
+                    e.position_id,
+                    e.brigade_id,
+                    e.department_id,
+                    e.status,
+                    p.name as position_name,
+                    b.name as brigade_name,
+                    d.name as department_name
+                FROM employees e
+                LEFT JOIN positions p ON p.id = e.position_id
+                LEFT JOIN brigades b ON b.id = e.brigade_id
+                LEFT JOIN departments d ON d.id = e.department_id
+                WHERE 1=1
+            ";
             
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to fetch heatmap data',
-                'message' => $e->getMessage()
-            ], 500);
-        }
+            $bindings = [];
+            
+            // Применяем фильтры
+            if ($request->filled('brigade_id')) {
+                $employeeQuery .= " AND e.brigade_id = ?";
+                $bindings[] = $request->brigade_id;
+            }
+            
+            if ($request->filled('department_id')) {
+                $employeeQuery .= " AND e.department_id = ?";
+                $bindings[] = $request->department_id;
+            }
+            
+            if ($request->filled('position_id')) {
+                $employeeQuery .= " AND e.position_id = ?";
+                $bindings[] = $request->position_id;
+            }
+            
+            if ($request->filled('status')) {
+                $employeeQuery .= " AND e.status = ?";
+                $bindings[] = $request->status;
+            }
+            
+            if ($request->filled('search')) {
+                $employeeQuery .= " AND e.full_name LIKE ?";
+                $bindings[] = "%{$request->search}%";
+            }
+            
+            $employees = DB::select($employeeQuery, $bindings);
+            
+            // Получаем все обучения сотрудников одним запросом
+            $employeeCoursesMap = [];
+            
+            if (!empty($employees)) {
+                $employeeIds = array_column($employees, 'id');
+                $employeeIdsStr = implode(',', $employeeIds);
+                
+                $trainingsQuery = "
+                    SELECT 
+                        ec.employee_id,
+                        ec.course_id,
+                        ec.status
+                    FROM employee_courses ec
+                    WHERE ec.employee_id IN ({$employeeIdsStr})
+                ";
+                
+                $trainings = DB::select($trainingsQuery);
+                
+                foreach ($trainings as $training) {
+                    $employeeCoursesMap[$training->employee_id][$training->course_id] = $training->status;
+                }
+            }
+            
+            // Формируем ответ
+            $formattedEmployees = [];
+            foreach ($employees as $employee) {
+                $trainingsStatus = [];
+                $overallStatus = 'active';
+                
+                foreach ($courses as $course) {
+                    $status = $employeeCoursesMap[$employee->id][$course->id] ?? null;
+                    
+                    // Пропускаем курсы, которые не назначены сотруднику (noData)
+                    if (!$status) {
+                        continue;
+                    }
+                    
+                    $trainingsStatus['course_' . $course->id] = $status;
+                    
+                    if ($status === 'expired') {
+                        $overallStatus = 'expired';
+                    } elseif ($status === 'expiring' && $overallStatus !== 'expired') {
+                        $overallStatus = 'expiring';
+                    } elseif ($status === 'required' && $overallStatus !== 'expired' && $overallStatus !== 'expiring') {
+                        $overallStatus = 'required';
+                    }
+                }
+                
+                $trainingsStatus['_overall'] = $overallStatus;
+                
+                $formattedEmployees[] = [
+                    'id' => $employee->id,
+                    'name' => $this->sanitizeString($employee->full_name),
+                    'position' => $this->sanitizeString($employee->position_name ?? 'Не указана'),
+                    'positionId' => $employee->position_id,
+                    'brigade' => $this->sanitizeString($employee->brigade_name ?? 'Не указана'),
+                    'brigadeId' => $employee->brigade_id,
+                    'department' => $this->sanitizeString($employee->department_name ?? 'Не указано'),
+                    'departmentId' => $employee->department_id,
+                    'status' => $employee->status,
+                    'trainings' => $trainingsStatus,
+                    'overallStatus' => $overallStatus
+                ];
+            }
+            
+            // Получаем справочники для фильтров
+            $brigades = Cache::remember('heatmap_brigades', now()->addHours(24), function() {
+                return DB::table('brigades')->orderBy('name')->pluck('name')->toArray();
+            });
+            
+            $departments = Cache::remember('heatmap_departments', now()->addHours(24), function() {
+                return DB::table('departments')->orderBy('name')->pluck('name')->toArray();
+            });
+            
+            return [
+                'employees' => $formattedEmployees,
+                'trainingTypes' => $trainingTypes,
+                'brigades' => $brigades,
+                'departments' => $departments,
+                'totalEmployees' => count($employees),
+                'totalTrainings' => $courses->count()
+            ];
+        });
+        
+        return response()->json($result)->setEncodingOptions(JSON_UNESCAPED_UNICODE);
+        
+    } catch (\Exception $e) {
+        \Log::error('Heatmap error: ' . $e->getMessage());
+        return response()->json([
+            'error' => 'Failed to fetch heatmap data',
+            'message' => $e->getMessage()
+        ], 500);
     }
+}
         
     /**
      * 3.2 GET /heatmap/employee/{employeeId} - Данные по сотруднику
