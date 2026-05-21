@@ -504,7 +504,7 @@ class TrainingEventController extends Controller
     }
     
     /**
-     * POST  /training-events - Создание мероприятия
+     * POST /training-events - Создание мероприятия
      */
     public function store(Request $request)
     {
