@@ -517,7 +517,7 @@ class TrainingEventController extends Controller
                 'end_date' => 'nullable|date|after_or_equal:start_date',
                 'location' => 'nullable|string|max:255',
                 'training_center' => 'nullable|string|max:200',
-                'status' => 'in:draft,confirmed,in_progress,completed,cancelled',
+                'status' => 'in:draft,planned,confirmed,in_progress,completed,cancelled,awaiting_confirmation',
                 'cost' => 'nullable|numeric|min:0',
                 'max_participants' => 'nullable|integer|min:1',
                 'notes' => 'nullable|string',
@@ -580,7 +580,7 @@ class TrainingEventController extends Controller
                 'end_date' => 'nullable|date|after_or_equal:start_date',
                 'location' => 'nullable|string|max:255',
                 'training_center' => 'nullable|string|max:200',
-                'status' => 'in:draft,confirmed,in_progress,completed,cancelled',
+                'status' => 'in:draft,planned,confirmed,in_progress,completed,cancelled,awaiting_confirmation',
                 'cost' => 'nullable|numeric|min:0',
                 'max_participants' => 'nullable|integer|min:1',
                 'notes' => 'nullable|string'
