@@ -23,163 +23,163 @@ class CourseController extends Controller
      * 6.1 GET /courses - Список курсов
      */
     public function index(Request $request)
-    {
-        try {
-            // Строим условия WHERE для фильтрации
-            $whereConditions = [];
-            $bindings = [];
-            
-            if ($request->has('category_id') && $request->category_id) {
-                $whereConditions[] = "c.category_id = ?";
-                $bindings[] = $request->category_id;
-            }
-            
-            if ($request->has('subcategory') && $request->subcategory) {
-                $whereConditions[] = "c.subcategory = ?";
-                $bindings[] = $request->subcategory;
-            }
-            
-            if ($request->has('type') && $request->type) {
-                $whereConditions[] = "c.type = ?";
-                $bindings[] = $request->type;
-            }
-            
-            if ($request->has('direction') && $request->direction) {
-                $whereConditions[] = "c.direction = ?";
-                $bindings[] = $request->direction;
-            }
-            
-            // Поиск по названию, подкатегории или направлению
-            if ($request->has('search') && $request->search) {
-                $search = $request->search;
-                $whereConditions[] = "(c.name LIKE ? OR c.subcategory LIKE ? OR c.direction LIKE ?)";
-                $bindings[] = "%{$search}%";
-                $bindings[] = "%{$search}%";
-                $bindings[] = "%{$search}%";
-            }
-            
-            $whereClause = !empty($whereConditions) ? "WHERE " . implode(" AND ", $whereConditions) : "";
-            
-            // Сортировка
-            $sortField = $request->get('sort_by', 'name');
-            $sortDirection = $request->get('sort_direction', 'asc');
-            
-            // Разрешенные поля для сортировки
-            $allowedSortFields = ['name', 'category_id', 'subcategory', 'type', 'direction', 'duration_hours', 'periodicity_months', 'created_at'];
-            if (!in_array($sortField, $allowedSortFields)) {
-                $sortField = 'name';
-            }
-            
-            $sortDirection = strtolower($sortDirection) === 'desc' ? 'DESC' : 'ASC';
-            
-            // Основной SQL запрос
-            $sql = "
-                SELECT 
-                    c.id,
-                    c.name,
-                    c.category_id,
-                    c.subcategory,
-                    c.type,
-                    c.legal_basis,
-                    c.direction,
-                    c.duration_hours,
-                    c.periodicity_months,
-                    c.description,
-                    c.created_at,
-                    cc.name as category_name
-                FROM courses c
-                LEFT JOIN course_categories cc ON c.category_id = cc.id
-                {$whereClause}
-                ORDER BY c.{$sortField} {$sortDirection}
-            ";
-            
-            $courses = DB::select($sql, $bindings);
-            
-            // Форматируем результаты
-            $formattedCourses = array_map(function($course) {
-                return [
-                    'id' => $course->id,
-                    'name' => $course->name,
-                    'category' => $course->category_name ?? 'Без категории',
-                    'category_id' => $course->category_id,
-                    'subcategory' => $course->subcategory,
-                    'type' => $course->type,
-                    'legal_basis' => $course->legal_basis,
-                    'direction' => $course->direction,
-                    'duration' => $course->duration_hours ? $course->duration_hours . ' часов' : 'Не указано',
-                    'duration_hours' => $course->duration_hours,
-                    'periodicity' => $course->periodicity_months ? $course->periodicity_months . ' ' . $this->getPeriodicityText($course->periodicity_months) : 'Не указано',
-                    'periodicity_months' => $course->periodicity_months,
-                    'description' => $course->description,
-                    'created_at' => $course->created_at
-                ];
-            }, $courses);
-            
-            return response()->json([
-                'courses' => $formattedCourses
-            ], 200);
-            
-        } catch (\Exception $e) {
-            return response()->json([
-                'error' => 'Failed to fetch courses',
-                'message' => $e->getMessage()
-            ], 500);
+{
+    try {
+        // Строим условия WHERE для фильтрации
+        $whereConditions = [];
+        $bindings = [];
+        
+        if ($request->has('category_id') && $request->category_id) {
+            $whereConditions[] = "c.category_id = ?";
+            $bindings[] = $request->category_id;
         }
+        
+        if ($request->has('subcategory') && $request->subcategory) {
+            $whereConditions[] = "c.subcategory = ?";
+            $bindings[] = $request->subcategory;
+        }
+        
+        if ($request->has('type') && $request->type) {
+            $whereConditions[] = "c.type = ?";
+            $bindings[] = $request->type;
+        }
+        
+        if ($request->has('direction') && $request->direction) {
+            $whereConditions[] = "c.direction = ?";
+            $bindings[] = $request->direction;
+        }
+        
+        // Поиск по названию, подкатегории или направлению
+        if ($request->has('search') && $request->search) {
+            $search = $request->search;
+            $whereConditions[] = "(c.name LIKE ? OR c.subcategory LIKE ? OR c.direction LIKE ?)";
+            $bindings[] = "%{$search}%";
+            $bindings[] = "%{$search}%";
+            $bindings[] = "%{$search}%";
+        }
+        
+        $whereClause = !empty($whereConditions) ? "WHERE " . implode(" AND ", $whereConditions) : "";
+        
+        // Сортировка
+        $sortField = $request->get('sort_by', 'name');
+        $sortDirection = $request->get('sort_direction', 'asc');
+        
+        // Разрешенные поля для сортировки
+        $allowedSortFields = ['name', 'category_id', 'subcategory', 'type', 'direction', 'duration_hours', 'periodicity_months', 'created_at'];
+        if (!in_array($sortField, $allowedSortFields)) {
+            $sortField = 'name';
+        }
+        
+        $sortDirection = strtolower($sortDirection) === 'desc' ? 'DESC' : 'ASC';
+        
+        // Основной SQL запрос (добавлено поле permanent)
+        $sql = "
+            SELECT 
+                c.id,
+                c.name,
+                c.category_id,
+                c.subcategory,
+                c.type,
+                c.legal_basis,
+                c.direction,
+                c.duration_hours,
+                c.periodicity_months,
+                c.description,
+                c.created_at,
+                cc.name as category_name
+            FROM courses c
+            LEFT JOIN course_categories cc ON c.category_id = cc.id
+            {$whereClause}
+            ORDER BY c.{$sortField} {$sortDirection}
+        ";
+        
+        $courses = DB::select($sql, $bindings);
+        
+        // Форматируем результаты (добавлено поле permanent)
+        $formattedCourses = array_map(function($course) {
+            return [
+                'id' => $course->id,
+                'name' => $course->name,
+                'category' => $course->category_name ?? 'Без категории',
+                'category_id' => $course->category_id,
+                'subcategory' => $course->subcategory,
+                'type' => $course->type,
+                'legal_basis' => $course->legal_basis,
+                'direction' => $course->direction,
+                'duration' => $course->duration_hours ? $course->duration_hours . ' часов' : 'Не указано',
+                'duration_hours' => $course->duration_hours,
+                'periodicity' => $course->periodicity_months ? $course->periodicity_months . ' ' . $this->getPeriodicityText($course->periodicity_months) : 'Не указано',
+                'periodicity_months' => $course->periodicity_months,
+                'description' => $course->description,
+                'created_at' => $course->created_at
+            ];
+        }, $courses);
+        
+        return response()->json([
+            'courses' => $formattedCourses
+        ], 200);
+        
+    } catch (\Exception $e) {
+        return response()->json([
+            'error' => 'Failed to fetch courses',
+            'message' => $e->getMessage()
+        ], 500);
     }
+}
 
-    private function getPeriodicityText(int $months): string
-    {
-        $years = floor($months / 12);
-        $remainingMonths = $months % 12;
-        
-        if ($years > 0 && $remainingMonths > 0) {
-            return $years . ' ' . $this->getYearText($years) . ' ' . $remainingMonths . ' ' . $this->getMonthText($remainingMonths);
-        } elseif ($years > 0) {
-            return $years . ' ' . $this->getYearText($years);
-        } else {
-            return $months . ' ' . $this->getMonthText($months);
-        }
+private function getPeriodicityText(int $months): string
+{
+    $years = floor($months / 12);
+    $remainingMonths = $months % 12;
+    
+    if ($years > 0 && $remainingMonths > 0) {
+        return $years . ' ' . $this->getYearText($years) . ' ' . $remainingMonths . ' ' . $this->getMonthText($remainingMonths);
+    } elseif ($years > 0) {
+        return $years . ' ' . $this->getYearText($years);
+    } else {
+        return $months . ' ' . $this->getMonthText($months);
     }
+}
 
-    private function getYearText(int $years): string
-    {
-        $lastDigit = $years % 10;
-        $lastTwoDigits = $years % 100;
-        
-        if ($lastTwoDigits >= 11 && $lastTwoDigits <= 19) {
-            return 'лет';
-        }
-        
-        if ($lastDigit == 1) {
-            return 'год';
-        }
-        
-        if ($lastDigit >= 2 && $lastDigit <= 4) {
-            return 'года';
-        }
-        
+private function getYearText(int $years): string
+{
+    $lastDigit = $years % 10;
+    $lastTwoDigits = $years % 100;
+    
+    if ($lastTwoDigits >= 11 && $lastTwoDigits <= 19) {
         return 'лет';
     }
+    
+    if ($lastDigit == 1) {
+        return 'год';
+    }
+    
+    if ($lastDigit >= 2 && $lastDigit <= 4) {
+        return 'года';
+    }
+    
+    return 'лет';
+}
 
-    private function getMonthText(int $months): string
-    {
-        $lastDigit = $months % 10;
-        $lastTwoDigits = $months % 100;
-        
-        if ($lastTwoDigits >= 11 && $lastTwoDigits <= 19) {
-            return 'месяцев';
-        }
-        
-        if ($lastDigit == 1) {
-            return 'месяц';
-        }
-        
-        if ($lastDigit >= 2 && $lastDigit <= 4) {
-            return 'месяца';
-        }
-        
+private function getMonthText(int $months): string
+{
+    $lastDigit = $months % 10;
+    $lastTwoDigits = $months % 100;
+    
+    if ($lastTwoDigits >= 11 && $lastTwoDigits <= 19) {
         return 'месяцев';
     }
+    
+    if ($lastDigit == 1) {
+        return 'месяц';
+    }
+    
+    if ($lastDigit >= 2 && $lastDigit <= 4) {
+        return 'месяца';
+    }
+    
+    return 'месяцев';
+}
         
     /**
      * 6.2 GET /courses/categories - Категории курсов

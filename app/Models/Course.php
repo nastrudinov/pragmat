@@ -22,7 +22,7 @@ class Course extends Model
 
     protected $casts = [
         'duration_hours' => 'integer',
-        'periodicity_months' => 'integer',
+        'permanent' => 'boolean',
         'created_at' => 'datetime',
         'updated_at' => 'datetime',
     ];
