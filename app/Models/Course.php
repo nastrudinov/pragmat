@@ -17,12 +17,14 @@ class Course extends Model
         'direction',        // Добавлено
         'duration_hours',
         'periodicity_months',
+        'is_show',
         'description'
     ];
 
     protected $casts = [
         'duration_hours' => 'integer',
         'permanent' => 'boolean',
+        'is_show' => 'boolean',
         'created_at' => 'datetime',
         'updated_at' => 'datetime',
     ];

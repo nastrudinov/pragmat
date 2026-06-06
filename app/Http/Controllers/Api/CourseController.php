@@ -16,170 +16,169 @@ use Illuminate\Support\Facades\Validator;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Support\Facades\DB;
 use App\Models\TrainingEvent;
+use Illuminate\Support\Facades\Cache;
 
 class CourseController extends Controller
 {
     /**
      * 6.1 GET /courses - Список курсов
      */
-    public function index(Request $request)
-{
-    try {
-        // Строим условия WHERE для фильтрации
-        $whereConditions = [];
-        $bindings = [];
-        
-        if ($request->has('category_id') && $request->category_id) {
-            $whereConditions[] = "c.category_id = ?";
-            $bindings[] = $request->category_id;
+  public function index(Request $request)
+    {
+        try {
+            $whereConditions = [];
+            $bindings = [];
+            
+            // Временно убрали фильтр is_show
+            // $whereConditions[] = "c.is_show = 1";
+            
+            if ($request->has('category_id') && $request->category_id) {
+                $whereConditions[] = "c.category_id = ?";
+                $bindings[] = $request->category_id;
+            }
+            
+            if ($request->has('subcategory') && $request->subcategory) {
+                $whereConditions[] = "c.subcategory = ?";
+                $bindings[] = $request->subcategory;
+            }
+            
+            if ($request->has('type') && $request->type) {
+                $whereConditions[] = "c.type = ?";
+                $bindings[] = $request->type;
+            }
+            
+            if ($request->has('direction') && $request->direction) {
+                $whereConditions[] = "c.direction = ?";
+                $bindings[] = $request->direction;
+            }
+            
+            if ($request->has('search') && $request->search) {
+                $search = $request->search;
+                $whereConditions[] = "(c.name LIKE ? OR c.subcategory LIKE ? OR c.direction LIKE ?)";
+                $bindings[] = "%{$search}%";
+                $bindings[] = "%{$search}%";
+                $bindings[] = "%{$search}%";
+            }
+            
+            $whereClause = !empty($whereConditions) ? "WHERE " . implode(" AND ", $whereConditions) : "";
+            
+            $sortField = $request->get('sort_by', 'name');
+            $sortDirection = $request->get('sort_direction', 'asc');
+            
+            $allowedSortFields = ['name', 'category_id', 'subcategory', 'type', 'direction', 'duration_hours', 'periodicity_months', 'created_at'];
+            if (!in_array($sortField, $allowedSortFields)) {
+                $sortField = 'name';
+            }
+            
+            $sortDirection = strtolower($sortDirection) === 'desc' ? 'DESC' : 'ASC';
+            
+            $sql = "
+                SELECT 
+                    c.id,
+                    c.name,
+                    c.category_id,
+                    c.subcategory,
+                    c.type,
+                    c.legal_basis,
+                    c.direction,
+                    c.duration_hours,
+                    c.periodicity_months,
+                    c.is_show,
+                    c.description,
+                    c.created_at,
+                    cc.name as category_name
+                FROM courses c
+                LEFT JOIN course_categories cc ON c.category_id = cc.id
+                {$whereClause}
+                ORDER BY c.{$sortField} {$sortDirection}
+            ";
+            
+            $courses = DB::select($sql, $bindings);
+            
+            $formattedCourses = array_map(function($course) {
+                return [
+                    'id' => $course->id,
+                    'name' => $course->name,
+                    'category' => $course->category_name ?? 'Без категории',
+                    'category_id' => $course->category_id,
+                    'subcategory' => $course->subcategory,
+                    'type' => $course->type,
+                    'legal_basis' => $course->legal_basis,
+                    'direction' => $course->direction,
+                    'duration' => $course->duration_hours ? $course->duration_hours . ' часов' : 'Не указано',
+                    'duration_hours' => $course->duration_hours,
+                    'periodicity_months' => $course->periodicity_months,
+                    'is_show' => (bool)$course->is_show,
+                    'description' => $course->description,
+                    'created_at' => $course->created_at
+                ];
+            }, $courses);
+            
+            return response()->json([
+                'courses' => $formattedCourses
+            ], 200);
+            
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => 'Failed to fetch courses',
+                'message' => $e->getMessage()
+            ], 500);
         }
-        
-        if ($request->has('subcategory') && $request->subcategory) {
-            $whereConditions[] = "c.subcategory = ?";
-            $bindings[] = $request->subcategory;
-        }
-        
-        if ($request->has('type') && $request->type) {
-            $whereConditions[] = "c.type = ?";
-            $bindings[] = $request->type;
-        }
-        
-        if ($request->has('direction') && $request->direction) {
-            $whereConditions[] = "c.direction = ?";
-            $bindings[] = $request->direction;
-        }
-        
-        // Поиск по названию, подкатегории или направлению
-        if ($request->has('search') && $request->search) {
-            $search = $request->search;
-            $whereConditions[] = "(c.name LIKE ? OR c.subcategory LIKE ? OR c.direction LIKE ?)";
-            $bindings[] = "%{$search}%";
-            $bindings[] = "%{$search}%";
-            $bindings[] = "%{$search}%";
-        }
-        
-        $whereClause = !empty($whereConditions) ? "WHERE " . implode(" AND ", $whereConditions) : "";
-        
-        // Сортировка
-        $sortField = $request->get('sort_by', 'name');
-        $sortDirection = $request->get('sort_direction', 'asc');
-        
-        // Разрешенные поля для сортировки
-        $allowedSortFields = ['name', 'category_id', 'subcategory', 'type', 'direction', 'duration_hours', 'periodicity_months', 'created_at'];
-        if (!in_array($sortField, $allowedSortFields)) {
-            $sortField = 'name';
-        }
-        
-        $sortDirection = strtolower($sortDirection) === 'desc' ? 'DESC' : 'ASC';
-        
-        // Основной SQL запрос (добавлено поле permanent)
-        $sql = "
-            SELECT 
-                c.id,
-                c.name,
-                c.category_id,
-                c.subcategory,
-                c.type,
-                c.legal_basis,
-                c.direction,
-                c.duration_hours,
-                c.periodicity_months,
-                c.description,
-                c.created_at,
-                cc.name as category_name
-            FROM courses c
-            LEFT JOIN course_categories cc ON c.category_id = cc.id
-            {$whereClause}
-            ORDER BY c.{$sortField} {$sortDirection}
-        ";
-        
-        $courses = DB::select($sql, $bindings);
-        
-        // Форматируем результаты (добавлено поле permanent)
-        $formattedCourses = array_map(function($course) {
-            return [
-                'id' => $course->id,
-                'name' => $course->name,
-                'category' => $course->category_name ?? 'Без категории',
-                'category_id' => $course->category_id,
-                'subcategory' => $course->subcategory,
-                'type' => $course->type,
-                'legal_basis' => $course->legal_basis,
-                'direction' => $course->direction,
-                'duration' => $course->duration_hours ? $course->duration_hours . ' часов' : 'Не указано',
-                'duration_hours' => $course->duration_hours,
-                'periodicity' => $course->periodicity_months ? $course->periodicity_months . ' ' . $this->getPeriodicityText($course->periodicity_months) : 'Не указано',
-                'periodicity_months' => $course->periodicity_months,
-                'description' => $course->description,
-                'created_at' => $course->created_at
-            ];
-        }, $courses);
-        
-        return response()->json([
-            'courses' => $formattedCourses
-        ], 200);
-        
-    } catch (\Exception $e) {
-        return response()->json([
-            'error' => 'Failed to fetch courses',
-            'message' => $e->getMessage()
-        ], 500);
     }
-}
 
-private function getPeriodicityText(int $months): string
-{
-    $years = floor($months / 12);
-    $remainingMonths = $months % 12;
-    
-    if ($years > 0 && $remainingMonths > 0) {
-        return $years . ' ' . $this->getYearText($years) . ' ' . $remainingMonths . ' ' . $this->getMonthText($remainingMonths);
-    } elseif ($years > 0) {
-        return $years . ' ' . $this->getYearText($years);
-    } else {
-        return $months . ' ' . $this->getMonthText($months);
+    private function getPeriodicityText(int $months): string
+    {
+        $years = floor($months / 12);
+        $remainingMonths = $months % 12;
+        
+        if ($years > 0 && $remainingMonths > 0) {
+            return $years . ' ' . $this->getYearText($years) . ' ' . $remainingMonths . ' ' . $this->getMonthText($remainingMonths);
+        } elseif ($years > 0) {
+            return $years . ' ' . $this->getYearText($years);
+        } else {
+            return $months . ' ' . $this->getMonthText($months);
+        }
     }
-}
 
-private function getYearText(int $years): string
-{
-    $lastDigit = $years % 10;
-    $lastTwoDigits = $years % 100;
-    
-    if ($lastTwoDigits >= 11 && $lastTwoDigits <= 19) {
+    private function getYearText(int $years): string
+    {
+        $lastDigit = $years % 10;
+        $lastTwoDigits = $years % 100;
+        
+        if ($lastTwoDigits >= 11 && $lastTwoDigits <= 19) {
+            return 'лет';
+        }
+        
+        if ($lastDigit == 1) {
+            return 'год';
+        }
+        
+        if ($lastDigit >= 2 && $lastDigit <= 4) {
+            return 'года';
+        }
+        
         return 'лет';
     }
-    
-    if ($lastDigit == 1) {
-        return 'год';
-    }
-    
-    if ($lastDigit >= 2 && $lastDigit <= 4) {
-        return 'года';
-    }
-    
-    return 'лет';
-}
 
-private function getMonthText(int $months): string
-{
-    $lastDigit = $months % 10;
-    $lastTwoDigits = $months % 100;
-    
-    if ($lastTwoDigits >= 11 && $lastTwoDigits <= 19) {
+    private function getMonthText(int $months): string
+    {
+        $lastDigit = $months % 10;
+        $lastTwoDigits = $months % 100;
+        
+        if ($lastTwoDigits >= 11 && $lastTwoDigits <= 19) {
+            return 'месяцев';
+        }
+        
+        if ($lastDigit == 1) {
+            return 'месяц';
+        }
+        
+        if ($lastDigit >= 2 && $lastDigit <= 4) {
+            return 'месяца';
+        }
+        
         return 'месяцев';
     }
-    
-    if ($lastDigit == 1) {
-        return 'месяц';
-    }
-    
-    if ($lastDigit >= 2 && $lastDigit <= 4) {
-        return 'месяца';
-    }
-    
-    return 'месяцев';
-}
         
     /**
      * 6.2 GET /courses/categories - Категории курсов
@@ -316,6 +315,7 @@ private function getMonthText(int $months): string
                 'direction' => 'nullable|string|max:100',        // Добавлено
                 'duration_hours' => 'nullable|integer|min:1|max:1000',
                 'periodicity_months' => 'nullable|integer|min:1|max:120',
+                'is_show' => 'nullable|boolean',
                 'description' => 'nullable|string'
             ]);
             
@@ -345,6 +345,7 @@ private function getMonthText(int $months): string
                 'direction' => $request->direction,          // Добавлено
                 'duration_hours' => $request->duration_hours,
                 'periodicity_months' => $request->periodicity_months,
+                'is_show' => $request->get('is_show', false),
                 'description' => $request->description
             ]);
             
@@ -360,6 +361,7 @@ private function getMonthText(int $months): string
                 'direction' => $course->direction,          // Добавлено
                 'duration' => $course->duration_hours ? $course->duration_hours . ' часов' : 'Не указано',
                 'periodicity' => $course->periodicity_months ? $course->periodicity_months . ' ' . $this->getPeriodicityText($course->periodicity_months) : 'Не указано',
+                'is_show' => (bool)$course->is_show,
                 'description' => $course->description,
                 'createdAt' => $course->created_at->toISOString()
             ], 201);
@@ -390,6 +392,7 @@ private function getMonthText(int $months): string
                 'direction' => 'nullable|string|max:100',        // Добавлено
                 'duration_hours' => 'nullable|integer|min:1|max:1000',
                 'periodicity_months' => 'nullable|integer|min:1|max:120',
+                'is_show' => 'nullable|boolean',
                 'description' => 'nullable|string'
             ]);
             
@@ -435,6 +438,9 @@ private function getMonthText(int $months): string
             if ($request->has('periodicity_months')) {
                 $course->periodicity_months = $request->periodicity_months;
             }
+            if ($request->has('is_show')) {
+                $course->is_show = $request->is_show;
+            }
             if ($request->has('description')) {
                 $course->description = $request->description;
             }
@@ -452,6 +458,7 @@ private function getMonthText(int $months): string
                 'direction' => $course->direction,          // Добавлено
                 'duration' => $course->duration_hours ? $course->duration_hours . ' часов' : 'Не указано',
                 'periodicity' => $course->periodicity_months ? $course->periodicity_months . ' ' . $this->getPeriodicityText($course->periodicity_months) : 'Не указано',
+                'is_show' => (bool)$course->is_show,
                 'updatedAt' => $course->updated_at->toISOString()
             ], 200);
             
@@ -508,6 +515,73 @@ private function getMonthText(int $months): string
         }
     }
     
+    /**
+     * GET /courses/popular - Топ-5 курсов со статистикой
+     */
+    public function getPopularCourses()
+    {
+        try {
+            $sql = "
+                SELECT 
+                    c.id,
+                    c.name,
+                    c.category_id,
+                    cc.name as category_name,
+                    COUNT(DISTINCT ec.employee_id) as total_employees,
+                    SUM(CASE 
+                        WHEN ec.expiration_date IS NOT NULL 
+                        AND ec.expiration_date < CURDATE() 
+                        THEN 1 ELSE 0 END) as expired_count,
+                    SUM(CASE 
+                        WHEN ec.status = 'required' 
+                        OR (ec.completed_date IS NULL AND ec.expiration_date IS NULL)
+                        THEN 1 ELSE 0 END) as required_count,
+                    SUM(CASE 
+                        WHEN ec.expiration_date IS NOT NULL 
+                        AND ec.expiration_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 30 DAY) 
+                        THEN 1 ELSE 0 END) as expiring_month_count,
+                    SUM(CASE 
+                        WHEN ec.expiration_date IS NOT NULL 
+                        AND ec.expiration_date BETWEEN DATE_ADD(CURDATE(), INTERVAL 31 DAY) AND DATE_ADD(CURDATE(), INTERVAL 60 DAY) 
+                        THEN 1 ELSE 0 END) as expiring_two_months_count
+                FROM courses c
+                LEFT JOIN course_categories cc ON c.category_id = cc.id
+                LEFT JOIN employee_courses ec ON c.id = ec.course_id
+                WHERE c.is_show = 1
+                GROUP BY c.id, c.name, c.category_id, cc.name
+                ORDER BY total_employees DESC
+                LIMIT 5
+            ";
+            
+            $courses = DB::select($sql);
+            
+            $result = array_map(function($course) {
+                return [
+                    'id' => $course->id,
+                    'name' => $course->name,
+                    'category' => $course->category_name ?? 'Без категории',
+                    'category_id' => $course->category_id,
+                    'statistics' => [
+                        'total_employees' => (int)$course->total_employees,
+                        'expired' => (int)$course->expired_count,
+                        'required' => (int)$course->required_count,
+                        'expiring_in_month' => (int)$course->expiring_month_count,
+                        'expiring_in_two_months' => (int)$course->expiring_two_months_count
+                    ]
+                ];
+            }, $courses);
+            
+            return response()->json([
+                'courses' => $result
+            ], 200);
+            
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => 'Failed to fetch popular courses',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
     /**
      * GET /courses/filters - Получить доступные фильтры для курсов
      */
@@ -949,15 +1023,20 @@ private function getMonthText(int $months): string
             $employees = $employeeCourses->map(function($employeeCourse) {
                 $employee = $employeeCourse->employee;
                 
+                // Проверка на случай отсутствия сотрудника
+                if (!$employee) {
+                    return null;
+                }
+                
                 // Формируем ФИО
                 $fullName = trim(implode(' ', array_filter([
-                    $employee->last_name,
-                    $employee->first_name,
-                    $employee->middle_name
+                    $employee->last_name ?? '',
+                    $employee->first_name ?? '',
+                    $employee->middle_name ?? ''
                 ])));
                 
                 if (empty($fullName)) {
-                    $fullName = $employee->full_name;
+                    $fullName = $employee->full_name ?? 'Неизвестный сотрудник';
                 }
                 
                 return [
@@ -971,32 +1050,22 @@ private function getMonthText(int $months): string
                     'position_id' => $employee->position_id,
                     'department' => $employee->department?->name ?? 'Не указано',
                     'department_id' => $employee->department_id,
-                   /* 'brigade' => $employee->brigade?->name ?? 'Не указана',
-                    'brigade_id' => $employee->brigade_id,
-                    'status' => $employee->status,
-                    'email' => $employee->email,
-                    'phone' => $employee->phone,
-                    'training' => [
-                        'id' => $employeeCourse->id,
-                        'assigned_date' => $employeeCourse->assigned_date?->format('Y-m-d'),
-                        'completed_date' => $employeeCourse->completed_date?->format('Y-m-d'),
-                        'expiration_date' => $employeeCourse->expiration_date?->format('Y-m-d'),
-                        'status' => $employeeCourse->status,
-                        'certificate_number' => $employeeCourse->certificate_number,
-                        'regulatory_acts' => $employeeCourse->regulatory_acts
-                    ]*/
+                    'training_status' => $employeeCourse->status,
+                    'expiration_date' => $employeeCourse->expiration_date?->format('Y-m-d'),
+                    'assigned_date' => $employeeCourse->assigned_date?->format('Y-m-d'),
+                    'completed_date' => $employeeCourse->completed_date?->format('Y-m-d')
                 ];
-            });
+            })->filter(); // Удаляем null значения
             
-            // Статистика по курсу
+            // Статистика по курсу (исправлено)
             $statistics = [
                 'total_employees' => $employees->count(),
                 'by_status' => [
-                    'active' => $employees->where('training.status', 'active')->count(),
-                    'expired' => $employees->where('training.status', 'expired')->count(),
-                    'expiring' => $employees->where('training.status', 'expiring')->count(),
-                    'required' => $employees->where('training.status', 'required')->count(),
-                    'no_data' => $employees->where('training.status', 'noData')->count()
+                    'active' => $employees->where('training_status', 'active')->count(),
+                    'expired' => $employees->where('training_status', 'expired')->count(),
+                    'expiring' => $employees->where('training_status', 'expiring')->count(),
+                    'required' => $employees->where('training_status', 'required')->count(),
+                    'no_data' => $employees->where('training_status', 'noData')->count()
                 ],
                 'by_department' => $employees->groupBy('department_id')->map(function($group, $deptId) {
                     $dept = $group->first()['department'] ?? 'Без подразделения';
@@ -1006,7 +1075,7 @@ private function getMonthText(int $months): string
                     ];
                 })->values(),
                 'compliance_rate' => $employees->count() > 0 
-                    ? round(($employees->where('training.status', 'active')->count() / $employees->count()) * 100)
+                    ? round(($employees->where('training_status', 'active')->count() / $employees->count()) * 100)
                     : 0
             ];
             
@@ -1018,7 +1087,7 @@ private function getMonthText(int $months): string
                     'duration_hours' => $course->duration_hours,
                     'periodicity_months' => $course->periodicity_months
                 ],
-                'employees' => $employees,
+                'employees' => $employees->values(),
                 'statistics' => $statistics,
                 'total' => $employees->count()
             ], 200);
@@ -1028,6 +1097,7 @@ private function getMonthText(int $months): string
                 'error' => 'Course not found'
             ], 404);
         } catch (\Exception $e) {
+            \Log::error('Get course employees error: ' . $e->getMessage());
             return response()->json([
                 'error' => 'Failed to fetch course employees',
                 'message' => $e->getMessage()

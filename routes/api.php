@@ -14,6 +14,8 @@ use App\Http\Controllers\Api\DepartmentController;
 use App\Http\Controllers\Api\TrainingEventController;
 use App\Http\Controllers\Api\UserController;
 use App\Http\Controllers\Api\AuthController;
+use App\Http\Controllers\Api\BulkTrainingController;
+
 use Illuminate\Http\Request;
 
 // ==================== ПУБЛИЧНЫЕ МАРШРУТЫ (без авторизации) ====================
@@ -103,10 +105,11 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::get('/', [CourseController::class, 'index']);
         Route::get('/categories', [CourseController::class, 'getCategories']);
         Route::get('/filters', [CourseController::class, 'getFilters']);
+        Route::get('/popular', [CourseController::class, 'getPopularCourses']);  // <-- ПЕРЕНЕСИТЕ СЮДА
         Route::get('/required/{positionId}', [CourseController::class, 'getRequiredCoursesForPosition']);
         Route::get('/required/brigade/{brigadeId}', [CourseController::class, 'getRequiredCoursesForBrigade']);
         Route::post('/', [CourseController::class, 'store']);
-        Route::get('/{id}', [CourseController::class, 'show']);
+        Route::get('/{id}', [CourseController::class, 'show']);  // ЭТО ДОЛЖНО БЫТЬ ПОСЛЕ СПЕЦИФИЧНЫХ МАРШРУТОВ
         Route::put('/{id}', [CourseController::class, 'update']);
         Route::delete('/{id}', [CourseController::class, 'destroy']);
         Route::get('/{courseId}/events', [CourseController::class, 'getCourseEvents']);
@@ -129,6 +132,7 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::get('/statistics', [TrainingController::class, 'getStatistics']);
         Route::get('/export', [TrainingController::class, 'export']);
         Route::get('/search', [TrainingController::class, 'search']);
+        Route::post('/bulk-update-expiration', [BulkTrainingController::class, 'bulkUpdateExpiration']);
         
         // Роуты с параметрами
         Route::get('/employee/{employeeId}', [TrainingController::class, 'getEmployeeTrainings']);

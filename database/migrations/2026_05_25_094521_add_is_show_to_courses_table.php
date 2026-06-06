@@ -9,14 +9,14 @@ return new class extends Migration
     public function up(): void
     {
         Schema::table('courses', function (Blueprint $table) {
-            $table->boolean('permanent')->default(false)->after('periodicity_months');
+            $table->boolean('is_show')->default(false)->after('periodicity_months');
         });
     }
 
     public function down(): void
     {
         Schema::table('courses', function (Blueprint $table) {
-            $table->dropColumn('permanent');
+            $table->dropColumn('is_show');
         });
     }
 };

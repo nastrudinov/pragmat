@@ -12,6 +12,7 @@ class CheckExpiredEvents extends Command
 
     public function handle()
     {
+       
         $count = TrainingEvent::where('end_date', '<', now())
             ->where('status', '!=', 'awaiting_confirmation')
             ->update(['status' => 'awaiting_confirmation']);
