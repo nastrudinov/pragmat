@@ -61,6 +61,7 @@ Route::middleware(['auth:sanctum'])->group(function () {
         Route::put('/{id}', [EmployeeController::class, 'update']);
         Route::delete('/{id}', [EmployeeController::class, 'destroy']);
         Route::post('/compliance/selected', [EmployeeController::class, 'getComplianceForSelected']);
+        Route::post('/{id}/change-position', [EmployeeController::class, 'changePosition']);
     });
     
     // ========== ДОЛЖНОСТИ ==========
@@ -127,6 +128,7 @@ Route::middleware(['auth:sanctum'])->group(function () {
     Route::prefix('trainings')->group(function () {
         // Специфичные статические роуты
         Route::get('/employee-courses-summary', [TrainingController::class, 'getEmployeeCoursesSummary']);
+        Route::get('/employee-courses-summary-show', [TrainingController::class, 'getEmployeeCoursesSummaryWithIsShow']);
         Route::get('/expired', [TrainingController::class, 'getExpiredTrainings']);
         Route::get('/expiring/{days}', [TrainingController::class, 'getExpiringTrainings']);
         Route::get('/statistics', [TrainingController::class, 'getStatistics']);

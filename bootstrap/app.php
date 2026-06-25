@@ -33,7 +33,5 @@ return Application::configure(basePath: dirname(__DIR__))
             }
         });
     })
-    ->withSchedule(function (Schedule $schedule) {
-        $schedule->command('events:check-expired')->dailyAt('22:00'); 
-    })
+
     ->create();

@@ -442,7 +442,9 @@ class TrainingEventController extends Controller
             $event = TrainingEvent::with(['course', 'participants.employee.position', 'participants.employee.department'])
                 ->findOrFail($id);
             
-            $participants = $event->participants->map(function($participant) {
+            $participants = $event->participants->filter(function($participant) {
+                return $participant->employee !== null;
+            })->map(function($participant) {
                 $employee = $participant->employee;
                 $fullName = trim(implode(' ', array_filter([
                     $employee->last_name,

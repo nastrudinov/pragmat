@@ -12,6 +12,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Database\Eloquent\ModelNotFoundException;
 use Illuminate\Support\Facades\DB;
+use Carbon\Carbon; 
 
 class EmployeeController extends Controller
 {
@@ -215,6 +216,111 @@ public function index(Request $request)
         }
     }
     
+    /**
+     * Смена должности сотрудника с синхронизацией обучений
+     * 
+     * @bodyParam position_id int required ID новой должности
+     * @bodyParam keep_training_ids array Массив ID курсов (course_id), которые нужно сохранить
+     */
+    public function changePosition(Request $request, $id)
+    {
+        try {
+            $validator = Validator::make($request->all(), [
+                'position_id' => 'required|exists:positions,id',
+                'keep_training_ids' => 'nullable|array',
+                'keep_training_ids.*' => 'exists:courses,id'
+            ]);
+            
+            if ($validator->fails()) {
+                return response()->json([
+                    'error' => 'Validation failed',
+                    'errors' => $validator->errors()
+                ], 422);
+            }
+            
+            $employee = Employee::findOrFail($id);
+            $oldPositionId = $employee->position_id;
+            $newPositionId = $request->position_id;
+            
+            // Если должность не меняется, просто возвращаем успех
+            if ($oldPositionId == $newPositionId) {
+                return response()->json([
+                    'message' => 'Должность не изменена',
+                    'employee_id' => $employee->id,
+                    'position_id' => $newPositionId
+                ]);
+            }
+            
+            DB::beginTransaction();
+            
+            try {
+                // 1. Получаем ID курсов, которые нужно сохранить (course_id из запроса)
+                $keepTrainingIds = $request->get('keep_training_ids', []);
+                
+                // 2. Удаляем все обучения сотрудника, кроме тех, чей course_id входит в keep_training_ids
+                $deletedCount = DB::table('employee_courses')
+                    ->where('employee_id', $employee->id)
+                    ->when(!empty($keepTrainingIds), function ($query) use ($keepTrainingIds) {
+                        return $query->whereNotIn('course_id', $keepTrainingIds);
+                    })
+                    ->delete();
+                
+                // 3. Обновляем должность сотрудника
+                $employee->position_id = $newPositionId;
+                $employee->save();
+                
+                // 4. Назначаем новые курсы из матрицы новой должности
+                $assignedCourses = $this->assignRequiredCoursesFromMatrix($employee);
+                
+                DB::commit();
+                
+                // 5. Загружаем актуальные обучения для ответа
+                $trainings = $this->getEmployeeTrainings($employee->id);
+                
+                return response()->json([
+                    'message' => 'Должность успешно изменена',
+                    'employee_id' => $employee->id,
+                    'old_position_id' => $oldPositionId,
+                    'new_position_id' => $newPositionId,
+                    'deleted_trainings_count' => $deletedCount,
+                    'new_assigned_courses_count' => $assignedCourses,
+                    'trainings' => $trainings
+                ]);
+                
+            } catch (\Exception $e) {
+                DB::rollBack();
+                throw $e;
+            }
+            
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => 'Failed to change position',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Получение обучений сотрудника (для ответа)
+     */
+    private function getEmployeeTrainings($employeeId)
+    {
+        return DB::table('employee_courses as ec')
+            ->join('courses as c', 'ec.course_id', '=', 'c.id')
+            ->where('ec.employee_id', $employeeId)
+            ->select(
+                'ec.id',
+                'c.name',
+                'ec.course_id',
+                'c.periodicity_months',
+                'ec.status',
+                'ec.assigned_date',
+                'ec.completed_date',
+                'ec.expiration_date'
+            )
+            ->orderBy('ec.id')
+            ->get();
+    }
     /**
      * 4.3 GET /employees/brigade/{brigadeId} - Сотрудники бригады
      */
@@ -456,7 +562,7 @@ public function index(Request $request)
     {
         try {
             $validator = Validator::make($request->all(), [
-                'personnel_number' => 'nullable|string|max:20|unique:employees,personnel_number',  // Добавлено
+                'personnel_number' => 'nullable|string|max:20|unique:employees,personnel_number',
                 'last_name' => 'required|string|max:50',
                 'first_name' => 'required|string|max:50',
                 'middle_name' => 'nullable|string|max:50',
@@ -482,47 +588,61 @@ public function index(Request $request)
                 $request->middle_name
             ])));
             
-            $employee = Employee::create([
-                'personnel_number' => $request->personnel_number,  // Добавлено
-                'full_name' => $fullName,
-                'last_name' => $request->last_name,
-                'first_name' => $request->first_name,
-                'middle_name' => $request->middle_name,
-                'position_id' => $request->position_id,
-                'brigade_id' => $request->brigade_id,
-                'department_id' => $request->department_id,
-                'email' => $request->email,
-                'phone' => $request->phone,
-                'status' => $request->get('status', 'active')
-            ]);
+            DB::beginTransaction(); // 👈 Начинаем транзакцию
             
-            $employee->load(['position', 'brigade', 'department']);
-            
-            // Формируем ответ с полным ФИО
-            $responseFullName = trim(implode(' ', array_filter([
-                $employee->last_name,
-                $employee->first_name,
-                $employee->middle_name
-            ])));
-            
-            return response()->json([
-                'id' => $employee->id,
-                'personnel_number' => $employee->personnel_number,  // Добавлено
-                'full_name' => $responseFullName,
-                'last_name' => $employee->last_name,
-                'first_name' => $employee->first_name,
-                'middle_name' => $employee->middle_name,
-                'position' => $employee->position?->name ?? 'Не указана',
-                'position_id' => $employee->position_id,
-                'department' => $employee->department?->name ?? 'Не указано',
-                'department_id' => $employee->department_id,
-                'brigade' => $employee->brigade?->name ?? 'Не указана',
-                'brigade_id' => $employee->brigade_id,
-                'status' => $employee->status,
-                'email' => $employee->email,
-                'phone' => $employee->phone,
-                'createdAt' => $employee->created_at->toISOString()
-            ], 201);
+            try {
+                $employee = Employee::create([
+                    'personnel_number' => $request->personnel_number,
+                    'full_name' => $fullName,
+                    'last_name' => $request->last_name,
+                    'first_name' => $request->first_name,
+                    'middle_name' => $request->middle_name,
+                    'position_id' => $request->position_id,
+                    'brigade_id' => $request->brigade_id,
+                    'department_id' => $request->department_id,
+                    'email' => $request->email,
+                    'phone' => $request->phone,
+                    'status' => $request->get('status', 'active')
+                ]);
+                
+                // 👇 КЛЮЧЕВОЕ: Автоматическое назначение курсов из матрицы
+                $assignedCoursesCount = $this->assignRequiredCoursesFromMatrix($employee);
+                
+                DB::commit(); // 👈 Фиксируем транзакцию
+                
+                $employee->load(['position', 'brigade', 'department']);
+                
+                // Формируем ответ с полным ФИО
+                $responseFullName = trim(implode(' ', array_filter([
+                    $employee->last_name,
+                    $employee->first_name,
+                    $employee->middle_name
+                ])));
+                
+                return response()->json([
+                    'id' => $employee->id,
+                    'personnel_number' => $employee->personnel_number,
+                    'full_name' => $responseFullName,
+                    'last_name' => $employee->last_name,
+                    'first_name' => $employee->first_name,
+                    'middle_name' => $employee->middle_name,
+                    'position' => $employee->position?->name ?? 'Не указана',
+                    'position_id' => $employee->position_id,
+                    'department' => $employee->department?->name ?? 'Не указано',
+                    'department_id' => $employee->department_id,
+                    'brigade' => $employee->brigade?->name ?? 'Не указана',
+                    'brigade_id' => $employee->brigade_id,
+                    'status' => $employee->status,
+                    'email' => $employee->email,
+                    'phone' => $employee->phone,
+                    'createdAt' => $employee->created_at->toISOString(),
+                    'assigned_courses_count' => $assignedCoursesCount // 👈 Опционально: сколько курсов назначено
+                ], 201);
+                
+            } catch (\Exception $e) {
+                DB::rollBack();
+                throw $e; // Перебрасываем в основной catch
+            }
             
         } catch (\Exception $e) {
             return response()->json([
@@ -531,7 +651,72 @@ public function index(Request $request)
             ], 500);
         }
     }
-    
+        
+    /**
+     * Назначение обязательных курсов сотруднику из матрицы компетенций (только по должности)
+     * 
+     * @param Employee $employee
+     * @return int Количество назначенных курсов
+     */
+    private function assignRequiredCoursesFromMatrix(Employee $employee): int
+    {
+        // Если у сотрудника нет должности, пропускаем
+        if (!$employee->position_id) {
+            \Log::info("Сотрудник {$employee->id} без должности, курсы не назначены");
+            return 0;
+        }
+        
+        // Получаем ID курсов из матрицы должности
+        $positionCourseIds = DB::table('position_course_requirements')
+            ->where('position_id', $employee->position_id)
+            ->pluck('course_id')
+            ->toArray();
+        
+        if (empty($positionCourseIds)) {
+            \Log::info("Для должности ID {$employee->position_id} нет обязательных курсов");
+            return 0;
+        }
+        
+        // Проверяем, какие курсы уже есть у сотрудника
+        $existingCourseIds = DB::table('employee_courses')
+            ->where('employee_id', $employee->id)
+            ->pluck('course_id')
+            ->toArray();
+        
+        // Оставляем только новые курсы (которых еще нет)
+        $newCourseIds = array_diff($positionCourseIds, $existingCourseIds);
+        
+        if (empty($newCourseIds)) {
+            return 0;
+        }
+        
+        // Подготавливаем данные для вставки
+        $now = now()->toDateString();
+        $assignments = [];
+        
+        foreach ($newCourseIds as $courseId) {
+            $assignments[] = [
+                'employee_id' => $employee->id,
+                'course_id' => $courseId,
+                'status' => 'required',
+                'assigned_date' => $now,
+                'completed_date' => null,
+                'expiration_date' => null,
+                'certificate_number' => null,
+                'regulatory_acts' => null,
+                'created_at' => now(),
+                'updated_at' => now(),
+            ];
+        }
+        
+        DB::table('employee_courses')->insert($assignments);
+        
+        // Очищаем кэш
+        cache()->forget("employee_{$employee->id}_trainings");
+        cache()->forget("employees_list");
+        
+        return count($assignments);
+    }
     /**
      * 4.8 PUT /employees/{id} - Обновление сотрудника
      */
