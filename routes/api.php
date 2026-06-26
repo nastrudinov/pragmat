@@ -18,6 +18,33 @@ use App\Http\Controllers\Api\BulkTrainingController;
 
 use Illuminate\Http\Request;
 
+Route::prefix('test')->group(function () {
+    // Простая проверка
+    Route::get('/ping', function () {
+        return ['pong' => now()->toDateTimeString()];
+    });
+    
+    // Проверка БД
+    Route::get('/db', function () {
+        try {
+            DB::connection()->getPdo();
+            return ['database' => 'connected'];
+        } catch (\Exception $e) {
+            return response()->json(['database' => 'error', 'message' => $e->getMessage()], 500);
+        }
+    });
+    
+    // Проверка конфигурации
+    Route::get('/config', function () {
+        return [
+            'app_name' => config('app.name'),
+            'env' => app()->environment(),
+            'timezone' => config('app.timezone'),
+            'debug' => config('app.debug')
+        ];
+    });
+});
+
 // ==================== ПУБЛИЧНЫЕ МАРШРУТЫ (без авторизации) ====================
 Route::prefix('auth')->group(function () {
     Route::post('/login', [AuthController::class, 'login'])->name('login');
